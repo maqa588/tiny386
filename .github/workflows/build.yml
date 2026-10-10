@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: esp-idf esp32p4 build
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v6.0.3
+        target: esp32p4
+        command: scripts/build.sh patch_idf_60 && scripts/build.sh esp_p4
+
+    - name: release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        UPLOADTOOL_ISPRERELEASE: "true"
+      run: wget -c https://github.com/probonopd/uploadtool/raw/master/upload.sh && scripts/build.sh bundle && bash upload.sh tiny386.tar.xz

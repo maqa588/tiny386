@@ -1,0 +1,23 @@
+CC = riscv32-esp-elf-gcc
+CFLAGS = -march=rv32imafc_zifencei -mabi=ilp32f -static -O3 -Isrc \
+  -D__riscv=1 -DBUILD_HEADLESS=1 -DUSE_FMOPL \
+  -DI386_ENABLE_FPU -DI386_ENABLE_MMX -DI386_ENABLE_SSE -DI386_ENABLE_SSE2 -DI386_ENABLE_SSE3 -DI386_ENABLE_SSSE3
+LDFLAGS = -static -lm
+
+SRCS = src/main_rv32.c src/rv32_syscalls.c src/i386.c src/jit.c src/fpu.c src/ini.c src/i8259.c src/i8254.c src/ide.c src/vga.c src/vgafont.c \
+       src/cirrus_vga.c src/cirrus_opencl.c src/cirrus_ppa.c \
+       src/i8042.c src/misc.c src/adlib.c src/ne2000.c src/i8257.c src/sb16.c src/pcspk.c src/fmopl.c src/pc.c src/pci.c src/win32.c
+
+OBJS = $(patsubst %.c,build/rv32/%.o,$(SRCS))
+
+all: tiny386_rv32
+
+build/rv32/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+tiny386_rv32: $(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
+
+clean:
+	rm -rf build/rv32 tiny386_rv32

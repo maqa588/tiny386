@@ -1,0 +1,35 @@
+# Editor / backup files
+*~
+*.swp
+
+# Build artifacts
+*.o
+*.a
+*.exe
+.depends
+fmopl.inc
+build/
+out/
+
+# Built binaries
+tiny386
+tiny386_rv32
+tiny386_headless
+wifikbd
+initnet
+tools/sdl2_viewer
+tests/test_jit_flow
+tests/test_jit_rv32
+test_jit_flow
+test_jit_rv32
+
+# Packaging
+*.tar.xz
+
+# Firmware & disk images (BIOS, DOS, Win95)
+/firmware/*
+# SeaBIOS BIOS/VGA BIOS binaries are redistributed under LGPL-3.0 (see README)
+!/firmware/seabios/
+
+# ESP-IDF generated files
+src/esp/sdkconfig

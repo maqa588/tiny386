@@ -1,0 +1,1277 @@
+#include "pc.h"
+#include "cirrus_vga.h"
+#include "jit.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#if defined(USE_AMD64)
+static void raise_irq_amd64(void *o, PicState2 *s)
+{
+	cpuamd64_raise_irq(o);
+}
+#else
+static void raise_irq_i386(void *o, PicState2 *s)
+{
+	cpui386_raise_irq(o);
+}
+#endif
+
+#if defined(USE_CPUABS)
+static void raise_irq_kvm(void *o, PicState2 *s)
+{
+	cpukvm_raise_irq(o);
+}
+
+typedef struct CPUABS {
+	void *cpu;
+	void (*reset)(void *cpu);
+	void (*reset_pm)(void *cpu, uint32_t start_addr);
+	void (*set_gpr)(void *cpu, int i, uint32_t val);
+	void (*step)(void *cpu, int stepcount);
+	void (*register_mem)(void *cpu, int slot, uint32_t addr, uint32_t len,
+			     void *ptr);
+	void (*enable_fpu)(void *cpu);
+	void (*_raise_irq)(void *, PicState2 *);
+} CPUABS;
+
+static CPUABS *cpu_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
+{
+	CPUABS *cpu = malloc(sizeof(CPUABS));
+	if (gen < 0) {
+		cpu->cpu = cpukvm_new(phys_mem, phys_mem_size, cb);
+		cpu->reset = (void *) cpukvm_reset;
+		cpu->reset_pm = (void *) cpukvm_reset_pm;
+		cpu->set_gpr = (void *) cpukvm_set_gpr;
+		cpu->step = (void *) cpukvm_step;
+		cpu->register_mem = (void *) cpukvm_register_mem;
+		cpu->enable_fpu = NULL;
+		cpu->_raise_irq = raise_irq_kvm;
+	} else {
+#if defined(USE_AMD64)
+		cpu->cpu = cpuamd64_new(gen, phys_mem, phys_mem_size, cb);
+		cpu->reset = (void *) cpuamd64_reset;
+		cpu->reset_pm = (void *) cpuamd64_reset_pm;
+		cpu->set_gpr = (void *) cpuamd64_set_gpr;
+		cpu->step = (void *) cpuamd64_step;
+		cpu->register_mem = NULL;
+		cpu->enable_fpu = NULL;
+		cpu->_raise_irq = raise_irq_amd64;
+#else
+		cpu->cpu = cpui386_new(gen, phys_mem, phys_mem_size, cb);
+		cpu->reset = (void *) cpui386_reset;
+		cpu->reset_pm = (void *) cpui386_reset_pm;
+		cpu->set_gpr = (void *) cpui386_set_gpr;
+		cpu->step = (void *) cpui386_step;
+		cpu->register_mem = NULL;
+		cpu->enable_fpu = (void *) cpui386_enable_fpu;
+		cpu->_raise_irq = raise_irq_i386;
+#endif
+	}
+	return cpu;
+}
+
+static void cpu_reset(CPUABS *cpu)
+{
+	cpu->reset(cpu->cpu);
+}
+
+static void cpu_reset_pm(CPUABS *cpu, uint32_t start_addr)
+{
+	cpu->reset_pm(cpu->cpu, start_addr);
+}
+
+static void cpu_set_gpr(CPUABS *cpu, int i, uint32_t val)
+{
+	cpu->set_gpr(cpu->cpu, i, val);
+}
+
+static void cpu_step(CPUABS *cpu, int stepcount)
+{
+	cpu->step(cpu->cpu, stepcount);
+}
+
+static void cpu_register_mem(CPUABS *cpu, int slot, uint32_t addr, uint32_t len,
+			     void *ptr)
+{
+	if (cpu->register_mem)
+		cpu->register_mem(cpu->cpu, slot, addr, len, ptr);
+}
+
+static void cpu_enable_fpu(CPUABS *cpu)
+{
+	if (cpu->enable_fpu)
+		cpu->enable_fpu(cpu->cpu);
+}
+
+#define raise_irq(o) ((o)->_raise_irq)
+#define raise_irq_param(o) ((o)->cpu)
+#else
+#if !defined(USE_AMD64)
+#define cpu_reset cpui386_reset
+#define cpu_reset_pm cpui386_reset_pm
+#define cpu_set_gpr cpui386_set_gpr
+#define cpu_step cpui386_step
+#define cpu_get_cycle cpui386_get_cycle
+#define cpu_get_state_str cpui386_get_state_str
+#define cpu_register_mem(...) do {} while (0) //noop
+#define cpu_enable_fpu cpui386_enable_fpu
+#define cpu_new cpui386_new
+#define raise_irq(...) raise_irq_i386
+#define raise_irq_param(o) (o)
+#else
+#define cpu_reset cpuamd64_reset
+#define cpu_reset_pm cpuamd64_reset_pm
+#define cpu_set_gpr cpuamd64_set_gpr
+#define cpu_step cpuamd64_step
+#define cpu_get_cycle cpuamd64_get_cycle
+#define cpu_register_mem(...) do {} while (0) //noop
+#define cpu_enable_fpu(...) do {} while (0) //noop
+#define cpu_new cpuamd64_new
+#define raise_irq(...) raise_irq_amd64
+#define raise_irq_param(o) (o)
+#endif
+#endif
+
+#ifdef BUILD_ESP32
+#ifndef MIXER_BUF_LEN
+#define MIXER_BUF_LEN 128
+#endif
+#define PC_STEP_COUNT 512
+void pcmalloc_init(void *ptr, long len);
+#else
+#define MIXER_BUF_LEN 2048
+#define PC_STEP_COUNT 10240
+#define pcmalloc_init(ptr, len)
+#endif
+
+static u8 pc_io_read(void *o, int addr)
+{
+	PC *pc = o;
+	u8 val;
+
+	switch(addr) {
+	case 0x20: case 0x21: case 0xa0: case 0xa1:
+		val = i8259_ioport_read(pc->pic, addr);
+		return val;
+	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
+	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+		val = 0xff;
+		if (pc->enable_serial)
+			val = u8250_reg_read(pc->serial, addr - 0x3f8);
+		return val;
+	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
+	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
+	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
+	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
+	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
+	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+		return 0;
+	case 0x42:
+		/* read delay for PIT channel 2 */
+		/* certain guest code needs it to drive pc speaker properly */
+		usleep(0);
+		/* fall through */
+	case 0x40: case 0x41: case 0x43:
+		val = i8254_ioport_read(pc->pit, addr);
+		return val;
+	case 0x70: case 0x71:
+		val = cmos_ioport_read(pc->cmos, addr);
+		return val;
+	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
+	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+		val = ide_ioport_read(pc->ide, addr - 0x1f0);
+		return val;
+	case 0x170: case 0x171: case 0x172: case 0x173:
+	case 0x174: case 0x175: case 0x176: case 0x177:
+		val = ide_ioport_read(pc->ide2, addr - 0x170);
+		return val;
+	case 0x3f6:
+		val = ide_status_read(pc->ide);
+		return val;
+	case 0x376:
+		val = ide_status_read(pc->ide2);
+		return val;
+	case 0x3b4: case 0x3b5: case 0x3ba:
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+		if (pc->cirrus)
+			val = cirrus_ioport_read(pc->cirrus, addr);
+		else
+			val = vga_ioport_read(pc->vga, addr);
+		return val;
+	case 0x92:
+		return pc->port92;
+	case 0x60:
+		val = kbd_read_data(pc->i8042, addr);
+		return val;
+	case 0x64:
+		val = kbd_read_status(pc->i8042, addr);
+		return val;
+	case 0x61:
+		val = pcspk_ioport_read(pc->pcspk);
+		return val;
+	case 0x220: case 0x221: case 0x222: case 0x223:
+	case 0x228: case 0x229:
+	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		return adlib_read(pc->adlib, addr);
+	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
+		return val;
+	case 0x300: case 0x301: case 0x302: case 0x303:
+	case 0x304: case 0x305: case 0x306: case 0x307:
+	case 0x308: case 0x309: case 0x30a: case 0x30b:
+	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+		val = ne2000_ioport_read(pc->ne2000, addr);
+		return val;
+	case 0x310:
+		val = ne2000_asic_ioport_read(pc->ne2000, addr);
+		return val;
+	case 0x31f:
+		val = ne2000_reset_ioport_read(pc->ne2000, addr);
+		return val;
+	case 0x00: case 0x01: case 0x02: case 0x03:
+	case 0x04: case 0x05: case 0x06: case 0x07:
+		val = i8257_read_chan(pc->isa_dma, addr - 0x00, 1);
+		return val;
+	case 0x08: case 0x09: case 0x0a: case 0x0b:
+	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+		val = i8257_read_cont(pc->isa_dma, addr - 0x08, 1);
+		return val;
+	case 0x81: case 0x82: case 0x83: case 0x87:
+		val = i8257_read_page(pc->isa_dma, addr - 0x80);
+		return val;
+	case 0x481: case 0x482: case 0x483: case 0x487:
+		val = i8257_read_pageh(pc->isa_dma, addr - 0x480);
+		return val;
+	case 0xc0: case 0xc2: case 0xc4: case 0xc6:
+	case 0xc8: case 0xca: case 0xcc: case 0xce:
+		val = i8257_read_chan(pc->isa_hdma, addr - 0xc0, 1);
+		return val;
+	case 0xd0: case 0xd2: case 0xd4: case 0xd6:
+	case 0xd8: case 0xda: case 0xdc: case 0xde:
+		val = i8257_read_cont(pc->isa_hdma, addr - 0xd0, 1);
+		return val;
+	case 0x89: case 0x8a: case 0x8b: case 0x8f:
+		val = i8257_read_page(pc->isa_hdma, addr - 0x88);
+		return val;
+	case 0x489: case 0x48a: case 0x48b: case 0x48f:
+		val = i8257_read_pageh(pc->isa_hdma, addr - 0x488);
+		return val;
+	case 0x225:
+		val = sb16_mixer_read(pc->sb16, addr);
+		return val;
+	case 0x226: case 0x22a: case 0x22c: case 0x22d: case 0x22e: case 0x22f:
+		val = sb16_dsp_read(pc->sb16, addr);
+		return val;
+	case 0xf1f4:
+		val = 0;
+		emulink_data_read_string(pc->emulink, &val, 1, 1);
+		return val;
+	case 0x402:
+	case 0xe9:
+		return 0xe9;
+	default:
+		//fprintf(stderr, "in 0x%x <= 0x%x\n", addr, 0xff);
+		return 0xff;
+	}
+}
+
+static u16 pc_io_read16(void *o, int addr)
+{
+	PC *pc = o;
+	u16 val;
+
+	switch(addr) {
+	case 0x1ce: case 0x1cf:
+		val = vbe_read(pc->vga, addr - 0x1ce);
+		return val;
+	case 0x1f0:
+		val = ide_data_readw(pc->ide);
+		return val;
+	case 0x170:
+		val = ide_data_readw(pc->ide2);
+		return val;
+	case 0xcf8:
+		val = i440fx_read_addr(pc->i440fx, 0, 1);
+		return val;
+	case 0xcfc: case 0xcfe:
+		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 1);
+		return val;
+	case 0x310:
+		val = ne2000_asic_ioport_read(pc->ne2000, addr);
+		return val;
+	case 0x220:
+		return adlib_read(pc->adlib, addr);
+	default:
+		return pc_io_read(pc, addr) | ((u16)pc_io_read(pc, addr + 1) << 8);
+	}
+}
+
+static u32 pc_io_read32(void *o, int addr)
+{
+	PC *pc = o;
+	u32 val;
+	switch(addr) {
+	case 0x1f0:
+		val = ide_data_readl(pc->ide);
+		return val;
+	case 0x170:
+		val = ide_data_readl(pc->ide2);
+		return val;
+	case 0x3cc:
+		return (get_uticks() - pc->boot_start_time) / 1000;
+	case 0xcf8:
+		val = i440fx_read_addr(pc->i440fx, 0, 2);
+		return val;
+	case 0xcfc:
+		val = i440fx_read_data(pc->i440fx, 0, 2);
+		return val;
+	case 0xf1f0:
+		val = emulink_status_read(pc->emulink);
+		return val;
+	default:
+		return pc_io_read16(pc, addr) | ((u32)pc_io_read16(pc, addr + 2) << 16);
+	}
+}
+
+static int pc_io_read_string(void *o, int addr, uint8_t *buf, int size, int count)
+{
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		return ide_data_read_string(pc->ide, buf, size, count);
+	case 0x170:
+		return ide_data_read_string(pc->ide2, buf, size, count);
+	case 0xf1f4:
+		return emulink_data_read_string(pc->emulink, buf, size, count);
+	}
+	return 0;
+}
+
+static void pc_io_write(void *o, int addr, u8 val)
+{
+	PC *pc = o;
+	switch(addr) {
+	case 0x80: case 0xed:
+		/* used by linux, for io delay */
+		return;
+	case 0x20: case 0x21: case 0xa0: case 0xa1:
+		i8259_ioport_write(pc->pic, addr, val);
+		return;
+	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
+	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+		u8250_reg_write(pc->serial, addr - 0x3f8, val);
+		return;
+	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
+	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
+	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
+	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
+	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
+	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+		return;
+	case 0x40: case 0x41: case 0x42: case 0x43:
+		i8254_ioport_write(pc->pit, addr, val);
+		return;
+	case 0x70: case 0x71:
+		cmos_ioport_write(pc->cmos, addr, val);
+		return;
+	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
+	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+		ide_ioport_write(pc->ide, addr - 0x1f0, val);
+		return;
+	case 0x170: case 0x171: case 0x172: case 0x173:
+	case 0x174: case 0x175: case 0x176: case 0x177:
+		ide_ioport_write(pc->ide2, addr - 0x170, val);
+		return;
+	case 0x3f6:
+		ide_cmd_write(pc->ide, val);
+		return;
+	case 0x376:
+		ide_cmd_write(pc->ide2, val);
+		return;
+	case 0x3b4: case 0x3b5: case 0x3ba:
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+		if (pc->cirrus)
+			cirrus_ioport_write(pc->cirrus, addr, val);
+		else
+			vga_ioport_write(pc->vga, addr, val);
+		return;
+	case 0x402:
+	case 0xe9:
+		putchar(val);
+		fflush(stdout);
+		return;
+	case 0x92:
+		if (val & 1)
+			pc->reset_request = 1;
+		pc->port92 = val & ~1;
+		return;
+	case 0x60:
+		kbd_write_data(pc->i8042, addr, val);
+		return;
+	case 0x64:
+		kbd_write_command(pc->i8042, addr, val);
+		return;
+	case 0x61:
+		pcspk_ioport_write(pc->pcspk, val);
+		return;
+	case 0x220: case 0x221: case 0x222: case 0x223:
+	case 0x228: case 0x229:
+	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		adlib_write(pc->adlib, addr, val);
+		return;
+	case 0x8900:
+		switch (val) {
+		case 'S': if (pc->shutdown_state == 0) pc->shutdown_state = 1; break;
+		case 'h': if (pc->shutdown_state == 1) pc->shutdown_state = 2; break;
+		case 'u': if (pc->shutdown_state == 2) pc->shutdown_state = 3; break;
+		case 't': if (pc->shutdown_state == 3) pc->shutdown_state = 4; break;
+		case 'd': if (pc->shutdown_state == 4) pc->shutdown_state = 5; break;
+		case 'o': if (pc->shutdown_state == 5) pc->shutdown_state = 6; break;
+		case 'w': if (pc->shutdown_state == 6) pc->shutdown_state = 7; break;
+		case 'n': if (pc->shutdown_state == 7) pc->shutdown_state = 8; break;
+		default : pc->shutdown_state = 0; break;
+		}
+		return;
+	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 0);
+		return;
+	case 0x300: case 0x301: case 0x302: case 0x303:
+	case 0x304: case 0x305: case 0x306: case 0x307:
+	case 0x308: case 0x309: case 0x30a: case 0x30b:
+	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+		ne2000_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x310:
+		ne2000_asic_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x31f:
+		ne2000_reset_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x00: case 0x01: case 0x02: case 0x03:
+	case 0x04: case 0x05: case 0x06: case 0x07:
+		i8257_write_chan(pc->isa_dma, addr - 0x00, val, 1);
+		return;
+	case 0x08: case 0x09: case 0x0a: case 0x0b:
+	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+		i8257_write_cont(pc->isa_dma, addr - 0x08, val, 1);
+		return;
+	case 0x81: case 0x82: case 0x83: case 0x87:
+		i8257_write_page(pc->isa_dma, addr - 0x80, val);
+		return;
+	case 0x481: case 0x482: case 0x483: case 0x487:
+		i8257_write_pageh(pc->isa_dma, addr - 0x480, val);
+		return;
+	case 0xc0: case 0xc2: case 0xc4: case 0xc6:
+	case 0xc8: case 0xca: case 0xcc: case 0xce:
+		i8257_write_chan(pc->isa_hdma, addr - 0xc0, val, 1);
+		return;
+	case 0xd0: case 0xd2: case 0xd4: case 0xd6:
+	case 0xd8: case 0xda: case 0xdc: case 0xde:
+		i8257_write_cont(pc->isa_hdma, addr - 0xd0, val, 1);
+		return;
+	case 0x89: case 0x8a: case 0x8b: case 0x8f:
+		i8257_write_page(pc->isa_hdma, addr - 0x88, val);
+		return;
+	case 0x489: case 0x48a: case 0x48b: case 0x48f:
+		i8257_write_pageh(pc->isa_hdma, addr - 0x488, val);
+		return;
+	case 0x224:
+		sb16_mixer_write_indexb(pc->sb16, addr, val);
+		return;
+	case 0x225:
+		sb16_mixer_write_datab(pc->sb16, addr, val);
+		return;
+	case 0x226: case 0x22c:
+		sb16_dsp_write(pc->sb16, addr, val);
+		return;
+	case 0xf1f4:
+		emulink_data_write_string(pc->emulink, &val, 1, 1);
+		return;
+	default:
+#ifdef DEBUG_UNKNOWN_IO
+		fprintf(stderr, "out 0x%x => 0x%x\n", val, addr);
+#endif
+		return;
+	}
+}
+
+static void pc_io_write16(void *o, int addr, u16 val)
+{
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		ide_data_writew(pc->ide, val);
+		return;
+	case 0x170:
+		ide_data_writew(pc->ide2, val);
+		return;
+	case 0x1ce: case 0x1cf:
+		vbe_write(pc->vga, addr - 0x1ce, val);
+		return;
+	case 0xcf8:
+		i440fx_write_addr(pc->i440fx, 0, val, 1);
+		return;
+	case 0xcfc: case 0xcfe:
+		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 1);
+		return;
+	case 0x310:
+		ne2000_asic_ioport_write(pc->ne2000, addr, val);
+		return;
+	default:
+		pc_io_write(pc, addr, val & 0xff);
+		pc_io_write(pc, addr + 1, (val >> 8) & 0xff);
+		return;
+	}
+}
+
+static void pc_io_write32(void *o, int addr, u32 val)
+{
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		ide_data_writel(pc->ide, val);
+		return;
+	case 0x170:
+		ide_data_writel(pc->ide2, val);
+		return;
+	case 0xcf8:
+		i440fx_write_addr(pc->i440fx, 0, val, 2);
+		return;
+	case 0xcfc:
+		i440fx_write_data(pc->i440fx, 0, val, 2);
+		return;
+	case 0xf1f0:
+		emulink_cmd_write(pc->emulink, val);
+		return;
+	case 0xf1f4:
+		emulink_data_write(pc->emulink, val);
+		return;
+	default:
+		pc_io_write16(pc, addr, val & 0xffff);
+		pc_io_write16(pc, addr + 2, (val >> 16) & 0xffff);
+		return;
+	}
+}
+
+static int pc_io_write_string(void *o, int addr, uint8_t *buf, int size, int count)
+{
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		return ide_data_write_string(pc->ide, buf, size, count);
+	case 0x170:
+		return ide_data_write_string(pc->ide2, buf, size, count);
+	case 0xf1f4:
+		return emulink_data_write_string(pc->emulink, buf, size, count);
+	}
+	return 0;
+}
+
+static uint64_t s_vga_frames = 0;
+
+void pc_vga_step(void *o)
+{
+	PC *pc = o;
+	int refresh = vga_step(pc->vga);
+	if (refresh) {
+		s_vga_frames++;
+
+		vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
+			    pc->full_update != 0);
+		if (pc->full_update == 2)
+			pc->full_update = 0;
+	}
+}
+
+#ifndef ENABLE_PERF_STATS
+#define ENABLE_PERF_STATS 1
+#endif
+
+#if ENABLE_PERF_STATS
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+static inline void pc_perf_stat_tick(PC *pc)
+{
+	static uint32_t last_time = 0;
+	static long last_cycles = 0;
+	static uint64_t last_frames = 0;
+	static uint32_t tick_div = 0;
+
+	if (unlikely(++tick_div >= 1024)) {
+		tick_div = 0;
+		uint32_t now = get_uticks();
+		if (last_time == 0) {
+			last_time = now;
+			last_cycles = cpu_get_cycle(pc->cpu);
+			last_frames = s_vga_frames;
+			return;
+		}
+		uint32_t dt = now - last_time;
+		if (dt >= 1000000) { /* 1 second interval */
+			long cur_cycles = cpu_get_cycle(pc->cpu);
+			long d_cycles = cur_cycles - last_cycles;
+			uint64_t d_frames = s_vga_frames - last_frames;
+			double seconds = (double)dt / 1000000.0;
+			double ips = (double)d_cycles / seconds;
+			double mips = ips / 1000000.0;
+			double fps = (double)d_frames / seconds;
+
+			char cpu_st[128] = {0};
+#if !defined(USE_AMD64) && !defined(USE_CPUABS)
+			cpu_get_state_str(pc->cpu, cpu_st, sizeof(cpu_st));
+#endif
+			uint32_t jit_execs = jit_get_block_exec_count();
+			uint32_t jit_comps = jit_get_compile_count();
+			if (jit_execs > 0 || jit_comps > 0) {
+				fprintf(stderr, "[PERF] Speed: %.2f MIPS (%.0f IPS) | VGA: %.1f FPS | JIT: %u exec, %u comp | %s\n",
+				        mips, ips, fps, (unsigned)jit_execs, (unsigned)jit_comps, cpu_st);
+			} else {
+				fprintf(stderr, "[PERF] Speed: %.2f MIPS (%.0f IPS) | VGA: %.1f FPS | %s\n",
+				        mips, ips, fps, cpu_st);
+			}
+
+			last_time = now;
+			last_cycles = cur_cycles;
+			last_frames = s_vga_frames;
+		}
+	}
+}
+#endif
+
+void pc_step(PC *pc)
+{
+	if (pc->reset_request) {
+		pc->reset_request = 0;
+		load_bios_and_reset(pc);
+	}
+
+	i8254_update_irq(pc->pit);
+	cmos_update_irq(pc->cmos);
+	if (pc->enable_serial)
+		u8250_update(pc->serial);
+	kbd_step(pc->i8042);
+	ne2000_step(pc->ne2000);
+	i8257_dma_run(pc->isa_dma);
+	i8257_dma_run(pc->isa_hdma);
+	cpu_step(pc->cpu, PC_STEP_COUNT);
+#if ENABLE_PERF_STATS
+	pc_perf_stat_tick(pc);
+#endif
+}
+
+static int read_irq(void *o)
+{
+	PicState2 *s = o;
+	return i8259_read_irq(s);
+}
+
+static void set_irq(void *o, int irq, int level)
+{
+	PicState2 *s = o;
+	return i8259_set_irq(s, irq, level);
+}
+
+static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabled)
+{
+	PC *pc = opaque;
+	if (bar_num == 0) {
+		if (enabled)
+			pc->pci_vga_ram_addr = addr;
+		else
+			pc->pci_vga_ram_addr = -1;
+
+		if (pc->cirrus) {
+			pc->cirrus->lfb_addr = addr;
+			pc->cirrus->lfb_enabled = enabled;
+		}
+
+		if (enabled)
+			cpu_register_mem(pc->cpu, 2, addr, pc->vga_mem_size,
+					 pc->vga_mem);
+		else
+			cpu_register_mem(pc->cpu, 2, addr, 0,
+					 NULL);
+	} else if (bar_num == 1) {
+		if (enabled)
+			pc->pci_vga_mmio_addr = addr;
+		else
+			pc->pci_vga_mmio_addr = -1;
+
+		if (pc->cirrus) {
+			pc->cirrus->mmio_addr = addr;
+			pc->cirrus->mmio_enabled = enabled;
+		}
+	}
+}
+
+static u8 iomem_read8(void *iomem, uword addr)
+{
+	PC *pc = iomem;
+	if (pc->pci_vga_mmio_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_mmio_addr &&
+	    addr < pc->pci_vga_mmio_addr + 0x1000) {
+		if (pc->cirrus)
+			return cirrus_mmio_read(pc->cirrus, addr - pc->pci_vga_mmio_addr);
+		return 0xff;
+	}
+	if (pc->pci_vga_ram_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_ram_addr &&
+	    addr < pc->pci_vga_ram_addr + pc->vga_mem_size) {
+		if (pc->cirrus) {
+			return cirrus_linear_read8(pc->cirrus, addr - pc->pci_vga_ram_addr);
+		}
+		uword offset = addr - pc->pci_vga_ram_addr;
+		return pc->vga_mem[offset];
+	}
+	if (pc->cirrus)
+		return cirrus_vga_mem_read(pc->cirrus, addr - 0xa0000);
+	return vga_mem_read(pc->vga, addr - 0xa0000);
+}
+
+static void iomem_write8(void *iomem, uword addr, u8 val)
+{
+	PC *pc = iomem;
+	if (pc->pci_vga_mmio_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_mmio_addr &&
+	    addr < pc->pci_vga_mmio_addr + 0x1000) {
+		if (pc->cirrus)
+			cirrus_mmio_write(pc->cirrus, addr - pc->pci_vga_mmio_addr, val);
+		return;
+	}
+	if (pc->pci_vga_ram_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_ram_addr &&
+	    addr < pc->pci_vga_ram_addr + pc->vga_mem_size) {
+		if (pc->cirrus) {
+			cirrus_linear_write8(pc->cirrus, addr - pc->pci_vga_ram_addr, val);
+			return;
+		}
+		uword offset = addr - pc->pci_vga_ram_addr;
+		pc->vga_mem[offset] = val;
+		return;
+	}
+	if (pc->cirrus) {
+		cirrus_vga_mem_write(pc->cirrus, addr - 0xa0000, val);
+		return;
+	}
+	vga_mem_write(pc->vga, addr - 0xa0000, val);
+}
+
+static u16 iomem_read16(void *iomem, uword addr)
+{
+	return iomem_read8(iomem, addr) |
+		((u16) iomem_read8(iomem, addr + 1) << 8);
+}
+
+static void iomem_write16(void *iomem, uword addr, u16 val)
+{
+	PC *pc = iomem;
+	if (pc->pci_vga_mmio_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_mmio_addr &&
+	    addr < pc->pci_vga_mmio_addr + 0x1000) {
+		iomem_write8(pc, addr, val & 0xff);
+		iomem_write8(pc, addr + 1, (val >> 8) & 0xff);
+		return;
+	}
+	if (pc->pci_vga_ram_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_ram_addr &&
+	    addr < pc->pci_vga_ram_addr + pc->vga_mem_size) {
+		if (pc->cirrus && cirrus_is_bitblt_cputovideo(pc->cirrus)) {
+			cirrus_bitblt_cputovideo_write(pc->cirrus, val & 0xff);
+			cirrus_bitblt_cputovideo_write(pc->cirrus, (val >> 8) & 0xff);
+			return;
+		}
+		if (pc->cirrus && (pc->cirrus->vga->gr[0x05] & 0x4) && (pc->cirrus->vga->gr[0x0B] & 0x4)) {
+			cirrus_linear_write8(pc->cirrus, addr - pc->pci_vga_ram_addr, val & 0xff);
+			cirrus_linear_write8(pc->cirrus, addr + 1 - pc->pci_vga_ram_addr, (val >> 8) & 0xff);
+			return;
+		}
+		uword offset = addr - pc->pci_vga_ram_addr;
+		if (offset + 1 < pc->vga_mem_size)
+			*(uint16_t *)&(pc->vga_mem[offset]) = val;
+		return;
+	}
+	if (pc->cirrus) {
+		cirrus_vga_mem_write(pc->cirrus, addr - 0xa0000, val & 0xff);
+		cirrus_vga_mem_write(pc->cirrus, addr + 1 - 0xa0000, (val >> 8) & 0xff);
+		return;
+	}
+	vga_mem_write16(pc->vga, addr - 0xa0000, val);
+}
+
+static u32 iomem_read32(void *iomem, uword addr)
+{
+	return iomem_read16(iomem, addr) |
+		((u32) iomem_read16(iomem, addr + 2) << 16);
+}
+
+static void iomem_write32(void *iomem, uword addr, u32 val)
+{
+	PC *pc = iomem;
+	if (pc->pci_vga_mmio_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_mmio_addr &&
+	    addr < pc->pci_vga_mmio_addr + 0x1000) {
+		iomem_write16(pc, addr, val & 0xffff);
+		iomem_write16(pc, addr + 2, val >> 16);
+		return;
+	}
+	if (pc->pci_vga_ram_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_ram_addr &&
+	    addr < pc->pci_vga_ram_addr + pc->vga_mem_size) {
+		if (pc->cirrus && cirrus_is_bitblt_cputovideo(pc->cirrus)) {
+			cirrus_bitblt_cputovideo_write(pc->cirrus, val & 0xff);
+			cirrus_bitblt_cputovideo_write(pc->cirrus, (val >> 8) & 0xff);
+			cirrus_bitblt_cputovideo_write(pc->cirrus, (val >> 16) & 0xff);
+			cirrus_bitblt_cputovideo_write(pc->cirrus, (val >> 24) & 0xff);
+			return;
+		}
+		if (pc->cirrus && (pc->cirrus->vga->gr[0x05] & 0x4) && (pc->cirrus->vga->gr[0x0B] & 0x4)) {
+			cirrus_linear_write8(pc->cirrus, addr - pc->pci_vga_ram_addr, val & 0xff);
+			cirrus_linear_write8(pc->cirrus, addr + 1 - pc->pci_vga_ram_addr, (val >> 8) & 0xff);
+			cirrus_linear_write8(pc->cirrus, addr + 2 - pc->pci_vga_ram_addr, (val >> 16) & 0xff);
+			cirrus_linear_write8(pc->cirrus, addr + 3 - pc->pci_vga_ram_addr, (val >> 24) & 0xff);
+			return;
+		}
+		uword offset = addr - pc->pci_vga_ram_addr;
+		if (offset + 3 < pc->vga_mem_size)
+			*(uint32_t *)&(pc->vga_mem[offset]) = val;
+		return;
+	}
+	if (pc->cirrus) {
+		iomem_write16(pc, addr, val & 0xffff);
+		iomem_write16(pc, addr + 2, val >> 16);
+		return;
+	}
+	vga_mem_write32(pc->vga, addr - 0xa0000, val);
+}
+
+#if defined(USE_AMD64)
+static u64 iomem_read64(void *iomem, uword addr)
+{
+	return iomem_read32(iomem, addr) |
+		((u64) iomem_read32(iomem, addr + 4) << 32);
+}
+
+static void iomem_write64(void *iomem, uword addr, u64 val)
+{
+	iomem_write32(iomem, addr, val & 0xffffffff);
+	iomem_write32(iomem, addr + 4, val >> 32);
+}
+#endif
+
+static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
+{
+	PC *pc = iomem;
+	if (pc->pci_vga_ram_addr != (uword)-1 &&
+	    addr >= pc->pci_vga_ram_addr &&
+	    addr < pc->pci_vga_ram_addr + pc->vga_mem_size) {
+		if (pc->cirrus && cirrus_is_bitblt_cputovideo(pc->cirrus)) {
+			cirrus_bitblt_cputovideo_write_buf(pc->cirrus, buf, len);
+			return true;
+		}
+		if (pc->cirrus && (pc->cirrus->vga->gr[0x05] & 0x4) && (pc->cirrus->vga->gr[0x0B] & 0x4)) {
+			for (int i = 0; i < len; i++) {
+				cirrus_linear_write8(pc->cirrus, addr + i - pc->pci_vga_ram_addr, buf[i]);
+			}
+			return true;
+		}
+		uword offset = addr - pc->pci_vga_ram_addr;
+		if (offset + len <= pc->vga_mem_size) {
+			memcpy(pc->vga_mem + offset, buf, len);
+			return true;
+		}
+		return false;
+	}
+	if (pc->cirrus) {
+		if (cirrus_is_bitblt_cputovideo(pc->cirrus)) {
+			cirrus_bitblt_cputovideo_write_buf(pc->cirrus, buf, len);
+			return true;
+		}
+		for (int i = 0; i < len; i++) {
+			cirrus_vga_mem_write(pc->cirrus, addr + i - 0xa0000, buf[i]);
+		}
+		return true;
+	}
+	return vga_mem_write_string(pc->vga, addr - 0xa0000, buf, len);
+}
+
+static void pc_reset_request(void *p)
+{
+	PC *pc = p;
+	pc->reset_request = 1;
+}
+
+static void pc_set_boot_order(void *cmos, uint8_t (*set)(void *cmos, int addr, uint8_t val), const char *boot)
+{
+	int dev[3] = {2, 1, 3}; // default: 1st HD (2), 2nd Floppy (1), 3rd CD-ROM (3)
+	if (boot) {
+		if (strcasecmp(boot, "cd") == 0 || strcasecmp(boot, "cdrom") == 0 ||
+		    strcasecmp(boot, "d") == 0) {
+			dev[0] = 3; dev[1] = 2; dev[2] = 1;
+		} else if (strcasecmp(boot, "a") == 0 || strcasecmp(boot, "fda") == 0 ||
+		           strcasecmp(boot, "floppy") == 0) {
+			dev[0] = 1; dev[1] = 2; dev[2] = 3;
+		} else if (strcasecmp(boot, "c") == 0 || strcasecmp(boot, "hda") == 0 ||
+		           strcasecmp(boot, "hd") == 0) {
+			dev[0] = 2; dev[1] = 1; dev[2] = 3;
+		} else {
+			int idx = 0;
+			for (const char *p = boot; *p && idx < 3; p++) {
+				int d = 0;
+				if (*p == 'a' || *p == 'A' || *p == 'f' || *p == 'F') d = 1;
+				else if (*p == 'c' || *p == 'C' || *p == 'h' || *p == 'H') d = 2;
+				else if (*p == 'd' || *p == 'D') d = 3;
+				if (d) dev[idx++] = d;
+			}
+		}
+	}
+	set(cmos, 0x3d, (dev[1] << 4) | dev[0]);
+	set(cmos, 0x38, (dev[2] << 4) | 0x01);
+}
+
+PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
+	   u8 *fb, PCConfig *conf)
+{
+	PC *pc = malloc(sizeof(PC));
+	char *mem = bigmalloc(conf->mem_size);
+	CPU_CB *cb = NULL;
+	memset(mem, 0, conf->mem_size);
+	pcmalloc_init(mem + 0xa0000, 0xc0000 - 0xa0000);
+	pc->cpu = cpu_new(conf->cpu_gen, mem, conf->mem_size, &cb);
+	if (conf->fpu)
+		cpu_enable_fpu(pc->cpu);
+#if defined(USE_AMD64)
+	if (conf->cpuid_vendor) {
+#if defined(USE_CPUABS)
+		if (conf->cpu_gen >= 0)
+			cpuamd64_set_vendor(pc->cpu->cpu, conf->cpuid_vendor);
+#else
+		cpuamd64_set_vendor(pc->cpu, conf->cpuid_vendor);
+#endif
+	}
+#endif
+	pc->bios = conf->bios;
+	pc->vga_bios = conf->vga_bios;
+	pc->linuxstart = conf->linuxstart;
+	if (!pc->bios) pc->bios = "bios.bin";
+	if (!pc->vga_bios) pc->vga_bios = "vgabios.bin";
+	if (!pc->linuxstart) pc->linuxstart = "linuxstart.bin";
+	pc->kernel = conf->kernel;
+	pc->initrd = conf->initrd;
+	pc->cmdline = conf->cmdline;
+	pc->enable_serial = conf->enable_serial;
+#if !defined(_WIN32) && !defined(__wasm__)
+	if (pc->enable_serial)
+		CaptureKeyboardInput();
+#endif
+	pc->full_update = 0;
+
+	pc->pic = i8259_init(raise_irq(pc->cpu), raise_irq_param(pc->cpu));
+	cb->pic = pc->pic;
+	cb->pic_read_irq = read_irq;
+
+	pc->pit = i8254_init(0, pc->pic, set_irq);
+	pc->serial = u8250_init(4, pc->pic, set_irq);
+	pc->cmos = cmos_init(conf->mem_size, 8, pc->pic, set_irq);
+	pc->ide = ide_allocate(14, pc->pic, set_irq);
+	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
+	const char **disks = conf->disks;
+	for (int i = 0; i < 4; i++) {
+		if (!disks[i] || disks[i][0] == 0)
+			continue;
+		int ret;
+		if (i < 2) {
+			if (conf->iscd[i])
+				ret = ide_attach_cd(pc->ide, i, disks[i]);
+			else
+				ret = ide_attach(pc->ide, i, disks[i]);
+			assert(ret == 0);
+		} else {
+			if (conf->iscd[i])
+				ret = ide_attach_cd(pc->ide2, i - 2, disks[i]);
+			else
+				ret = ide_attach(pc->ide2, i - 2, disks[i]);
+			assert(ret == 0);
+		}
+	}
+
+	if (conf->fill_cmos) {
+		if (conf->fdd[0] || conf->fdd[1]) {
+			uint8_t fd_type = (conf->fdd[0] ? 0x40 : 0) | (conf->fdd[1] ? 0x04 : 0);
+			cmos_set(pc->cmos, 0x10, fd_type);
+		}
+		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
+		pc_set_boot_order(pc->cmos, cmos_set, conf->boot);
+	}
+
+	int piix3_devfn;
+	pc->i440fx = i440fx_init(&pc->pcibus, &piix3_devfn);
+	pc->pci_ide = piix3_ide_init(pc->pcibus, piix3_devfn + 1);
+
+	pc->phys_mem = mem;
+	pc->phys_mem_size = conf->mem_size;
+
+	cb->io = pc;
+	cb->io_read8 = pc_io_read;
+	cb->io_write8 = pc_io_write;
+	cb->io_read16 = pc_io_read16;
+	cb->io_write16 = pc_io_write16;
+	cb->io_read32 = pc_io_read32;
+	cb->io_write32 = pc_io_write32;
+	cb->io_read_string = pc_io_read_string;
+	cb->io_write_string = pc_io_write_string;
+
+	pc->boot_start_time = 0;
+
+	bool is_cirrus = false;
+	if (conf->vga_card && strcmp(conf->vga_card, "cirrus") == 0) {
+		is_cirrus = true;
+	} else if (conf->vga_bios && strstr(conf->vga_bios, "cirrus") != NULL) {
+		is_cirrus = true;
+	}
+
+	pc->vga_mem_size = conf->vga_mem_size;
+	if (is_cirrus) {
+		if (pc->vga_mem_size <= 0)
+			pc->vga_mem_size = 2 * 1024 * 1024;
+	} else {
+		if (pc->vga_mem_size <= 0)
+			pc->vga_mem_size = 256 * 1024;
+	}
+	pc->vga_mem = bigmalloc(pc->vga_mem_size);
+	memset(pc->vga_mem, 0, pc->vga_mem_size);
+	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
+			   fb, conf->width, conf->height);
+	vga_set_force_8dm(pc->vga, conf->vga_force_8dm);
+
+	pc->pci_vga_ram_addr = -1;
+	pc->pci_vga_mmio_addr = -1;
+
+	if (is_cirrus) {
+		pc->cirrus = cirrus_vga_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar);
+		pc->pci_vga = pc->cirrus->pci_dev;
+		printf("[PC] Cirrus CL-GD5446 PCI VGA initialized (VRAM %d KB)\n", pc->vga_mem_size / 1024);
+	} else {
+		pc->cirrus = NULL;
+		pc->pci_vga = vga_pci_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar);
+	}
+
+	pc->emulink = emulink_init();
+	const char **fdd = conf->fdd;
+	for (int i = 0; i < 2; i++) {
+		if (!fdd[i] || fdd[i][0] == 0)
+			continue;
+		int ret;
+		ret = emulink_attach_floppy(pc->emulink, i, fdd[i]);
+		assert(ret == 0);
+	}
+
+	cb->iomem = pc;
+	cb->iomem_read8 = iomem_read8;
+	cb->iomem_write8 = iomem_write8;
+	cb->iomem_read16 = iomem_read16;
+	cb->iomem_write16 = iomem_write16;
+	cb->iomem_read32 = iomem_read32;
+	cb->iomem_write32 = iomem_write32;
+	cb->iomem_write_string = iomem_write_string;
+#if defined(USE_AMD64)
+	cb->iomem_read64 = iomem_read64;
+	cb->iomem_write64 = iomem_write64;
+#endif
+
+	pc->redraw = redraw;
+	pc->redraw_data = redraw_data;
+
+	pc->i8042 = i8042_init(&(pc->kbd), &(pc->mouse),
+			       1, 12, pc->pic, set_irq,
+			       pc, pc_reset_request);
+	pc->adlib = adlib_new();
+	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
+	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+				0x00, 0x80, 0x480, 0);
+	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+				 0xc0, 0x88, 0x488, 1);
+	pc->sb16 = sb16_new(0x220, 5,
+			    pc->isa_dma, pc->isa_hdma,
+			    pc->pic, set_irq);
+	pc->pcspk = pcspk_init(pc->pit);
+	pc->port92 = 0x2;
+	pc->shutdown_state = 0;
+	pc->reset_request = 0;
+	return pc;
+}
+
+void mixer_callback (void *opaque, uint8_t *stream, int free)
+{
+	uint8_t tmpbuf[MIXER_BUF_LEN];
+	PC *pc = opaque;
+	assert(free / 2 <= MIXER_BUF_LEN);
+	memset(tmpbuf, 0, MIXER_BUF_LEN);
+	adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
+	sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
+
+	int16_t *d2 = (int16_t *) stream;
+	int16_t *d1 = (int16_t *) tmpbuf;
+	for (int i = 0; i < free / 2; i++) {
+		int res = d2[i] + d1[i / 2];
+		if (res > 32767) res = 32767;
+		if (res < -32768) res = -32768;
+		d2[i] = res;
+	}
+
+	if (pcspk_get_active_out(pc->pcspk)) {
+		memset(tmpbuf, 0x80, MIXER_BUF_LEN / 2);
+		pcspk_callback(pc->pcspk, tmpbuf, free / 4); // u8, mono
+		for (int i = 0; i < free / 2; i++) {
+			int res = d2[i];
+			res += ((int) tmpbuf[i / 2] - 0x80) << 5;
+			if (res > 32767) res = 32767;
+			if (res < -32768) res = -32768;
+			d2[i] = res;
+		}
+	}
+}
+
+void load_bios_and_reset(PC *pc)
+{
+	if (pc->bios && pc->bios[0])
+		load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
+	if (pc->vga_bios && pc->vga_bios[0])
+		load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
+	if (pc->kernel && pc->kernel[0]) {
+		int start_addr = 0x10000;
+		int cmdline_addr = 0xf800;
+		int kernel_size = load_rom(pc->phys_mem, pc->kernel, 0x00100000, 0);
+		int initrd_size = 0;
+		if (pc->initrd && pc->initrd[0])
+			initrd_size = load_rom(pc->phys_mem, pc->initrd, 0x00400000, 0);
+		if (pc->cmdline && pc->cmdline[0])
+			strcpy(pc->phys_mem + cmdline_addr, pc->cmdline);
+		else
+			strcpy(pc->phys_mem + cmdline_addr, "");
+
+		load_rom(pc->phys_mem, pc->linuxstart, start_addr, 0);
+		cpu_reset_pm(pc->cpu, 0x10000);
+		cpu_set_gpr(pc->cpu, 0, pc->phys_mem_size);
+		cpu_set_gpr(pc->cpu, 3, initrd_size);
+		cpu_set_gpr(pc->cpu, 1, cmdline_addr);
+		cpu_set_gpr(pc->cpu, 2, kernel_size);
+	} else {
+		cpu_reset(pc->cpu);
+	}
+}
+
+static long parse_mem_size(const char *value)
+{
+	int len = strlen(value);
+	long a = atol(value);
+	if (len) {
+		switch (value[len - 1]) {
+		case 'G': a *= 1024 * 1024 * 1024; break;
+		case 'M': a *= 1024 * 1024; break;
+		case 'K': a *= 1024; break;
+		}
+	}
+	return a;
+}
+
+int parse_conf_ini(void* user, const char* section,
+		   const char* name, const char* value)
+{
+	PCConfig *conf = user;
+#define SEC(a) (strcmp(section, a) == 0)
+#define NAME(a) (strcmp(name, a) == 0)
+	if (SEC("pc")) {
+		if (NAME("bios")) {
+			conf->bios = strdup(value);
+		} else if (NAME("vga_bios")) {
+			conf->vga_bios = strdup(value);
+		} else if (NAME("vga_card")) {
+			conf->vga_card = strdup(value);
+		} else if (NAME("mem_size")) {
+			conf->mem_size = parse_mem_size(value);
+		} else if (NAME("vga_mem_size")) {
+			conf->vga_mem_size = parse_mem_size(value);
+		} else if (NAME("hda")) {
+			conf->disks[0] = strdup(value);
+			conf->iscd[0] = 0;
+		} else if (NAME("hdb")) {
+			conf->disks[1] = strdup(value);
+			conf->iscd[1] = 0;
+		} else if (NAME("hdc")) {
+			conf->disks[2] = strdup(value);
+			conf->iscd[2] = 0;
+		} else if (NAME("hdd")) {
+			conf->disks[3] = strdup(value);
+			conf->iscd[3] = 0;
+		} else if (NAME("cda")) {
+			conf->disks[0] = strdup(value);
+			conf->iscd[0] = 1;
+		} else if (NAME("cdb")) {
+			conf->disks[1] = strdup(value);
+			conf->iscd[1] = 1;
+		} else if (NAME("cdc")) {
+			conf->disks[2] = strdup(value);
+			conf->iscd[2] = 1;
+		} else if (NAME("cdd")) {
+			conf->disks[3] = strdup(value);
+			conf->iscd[3] = 1;
+		} else if (NAME("fda")) {
+			conf->fdd[0] = strdup(value);
+		} else if (NAME("fdb")) {
+			conf->fdd[1] = strdup(value);
+		} else if (NAME("fill_cmos")) {
+			conf->fill_cmos = atoi(value);
+		} else if (NAME("boot")) {
+			conf->boot = strdup(value);
+		} else if (NAME("linuxstart")) {
+			conf->linuxstart = strdup(value);
+		} else if (NAME("kernel")) {
+			conf->kernel = strdup(value);
+		} else if (NAME("initrd")) {
+			conf->initrd = strdup(value);
+		} else if (NAME("cmdline")) {
+			conf->cmdline = strdup(value);
+		} else if (NAME("enable_serial")) {
+			conf->enable_serial = atoi(value);
+		} else if (NAME("vga_force_8dm")) {
+			conf->vga_force_8dm = atoi(value);
+		}
+	} else if (SEC("display")) {
+		if (NAME("width")) {
+			conf->width = atoi(value);
+		} else if (NAME("height")) {
+			conf->height = atoi(value);
+		}
+	} else if (SEC("cpu")) {
+		if (NAME("gen")) {
+			conf->cpu_gen = atoi(value);
+		} else if (NAME("fpu")) {
+			conf->fpu = atoi(value);
+		} else if (NAME("cpuid_vendor")) {
+			conf->cpuid_vendor = strdup(value);
+		}
+	}
+#undef SEC
+#undef NAME
+	return 1;
+}
