@@ -1489,6 +1489,13 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
     SB16State *s = opaque;
     s->audio_free = free;
 
+    /* Always start from silence. The host may hand us a buffer that still
+       holds samples from the previous call; when playback stops abruptly
+       (no active output, an empty ring buffer, or a buffer underrun) or the
+       resampler produces fewer samples than fit, those stale samples would
+       otherwise be replayed over and over as a loud hum/buzz. */
+    memset(stream, 0, free);
+
     unsigned int len = s->audio_q - s->audio_p;
     if (len > AUDIO_BUF_LEN) {
         s->audio_p = s->audio_q;

@@ -27,9 +27,11 @@
 #include <string.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <sys/stat.h>
 
 //#include "cutils.h"
 #include "ide.h"
+#include "isofs.h"
 
 //#define DEBUG_IDE
 //#define DEBUG_IDE_ATAPI
@@ -322,6 +324,10 @@ struct BlockDevice {
     int (*write_async)(BlockDevice *bs,
                        uint64_t sector_num, const uint8_t *buf, int n,
                        BlockDeviceCompletionFunc *cb, void *opaque);
+    /* Push host-side write buffers to stable storage so a FLUSH CACHE command,
+       or an abrupt emulator exit, cannot lose data the guest considers
+       committed (e.g. the Windows 95 registry). */
+    int (*flush)(BlockDevice *bs);
     void *opaque;
 };
 
@@ -377,6 +383,9 @@ struct IDEIFState {
     IDEState *drives[2];
     /* 0x3f6 command */
     uint8_t cmd;
+
+    ide_cd_change_cb_t cd_change_cb;
+    void *cd_change_opaque;
 };
 
 static void ide_sector_read_cb(void *opaque, int ret);
@@ -763,6 +772,15 @@ static void ide_exec_cmd(IDEState *s, int val)
             ide_sector_write(s);
         }
         break;
+    case WIN_FLUSH_CACHE:
+    case WIN_FLUSH_CACHE_EXT:
+        /* Windows 95 issues this before it considers the registry reliably
+           committed; honour it instead of aborting the command. */
+        if (s->bs->flush)
+            s->bs->flush(s->bs);
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
     case WIN_READ_NATIVE_MAX:
         ide_set_sector(s, s->nb_sectors - 1);
         s->status = READY_STAT;
@@ -914,7 +932,11 @@ static int cdrom_read_toc_raw(int nb_sectors, uint8_t *buf, int msf, int session
 /* XXX: DVDs that could fit on a CD will be reported as a CD */
 static inline int media_present(IDEState *s)
 {
-    return (s->nb_sectors > 0);
+    if (!s || !s->bs || !s->bs->get_sector_count)
+        return 0;
+    int64_t count = s->bs->get_sector_count(s->bs);
+    s->nb_sectors = count;
+    return (count > 0);
 }
 
 static inline int media_is_dvd(IDEState *s)
@@ -954,8 +976,8 @@ static void ide_atapi_cmd_check_status(IDEState *s)
     printf("atapi_cmd_check_status\n");
 #endif
     s->error = MC_ERR | (SENSE_UNIT_ATTENTION << 4);
-    s->status = ERR_STAT;
-    s->nsector = 0;
+    s->status = READY_STAT | ERR_STAT;
+    s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
     ide_set_irq(s);
 }
 
@@ -1003,6 +1025,11 @@ static int cd_read_sector(BlockDevice *bs, int lba, uint8_t *buf,
 static void ide_atapi_io_error(IDEState *s, int ret)
 {
     /* XXX: handle more errors */
+    if (!media_present(s)) {
+        ide_atapi_cmd_error(s, SENSE_NOT_READY,
+                            ASC_MEDIUM_NOT_PRESENT);
+        return;
+    }
     ide_atapi_cmd_error(s, SENSE_ILLEGAL_REQUEST,
                         ASC_LOGICAL_BLOCK_OOR);
 }
@@ -1167,13 +1194,19 @@ static void ide_atapi_cmd(IDEState *s)
     }
     switch(s->io_buffer[0]) {
     case GPCMD_TEST_UNIT_READY:
-        if (!s->cdrom_changed) {
-            ide_atapi_cmd_ok(s);
-        } else {
+        if (!media_present(s)) {
             s->cdrom_changed = 0;
             ide_atapi_cmd_error(s, SENSE_NOT_READY,
                                 ASC_MEDIUM_NOT_PRESENT);
+            break;
         }
+        if (s->cdrom_changed) {
+            s->cdrom_changed = 0;
+            ide_atapi_cmd_error(s, SENSE_UNIT_ATTENTION,
+                                ASC_MEDIUM_MAY_HAVE_CHANGED);
+            break;
+        }
+        ide_atapi_cmd_ok(s);
         break;
     case GPCMD_MODE_SENSE_6:
     case GPCMD_MODE_SENSE_10:
@@ -1263,8 +1296,10 @@ static void ide_atapi_cmd(IDEState *s)
         buf[2] = s->sense_key;
         buf[7] = 10;
         buf[12] = s->asc;
-        if (s->sense_key == SENSE_UNIT_ATTENTION)
+        if (s->sense_key == SENSE_UNIT_ATTENTION) {
             s->sense_key = SENSE_NONE;
+            s->cdrom_changed = 0;
+        }
         ide_atapi_cmd_reply(s, 18, max_len);
         break;
     case GPCMD_PREVENT_ALLOW_MEDIUM_REMOVAL:
@@ -1284,6 +1319,16 @@ static void ide_atapi_cmd(IDEState *s)
                 ide_atapi_cmd_ok(s);
                 break;
             }
+            if (!media_present(s)) {
+                ide_atapi_cmd_error(s, SENSE_NOT_READY,
+                                    ASC_MEDIUM_NOT_PRESENT);
+                break;
+            }
+            if (((int64_t)lba + nb_sectors) > (s->nb_sectors >> 2)) {
+                ide_atapi_cmd_error(s, SENSE_ILLEGAL_REQUEST,
+                                    ASC_LOGICAL_BLOCK_OOR);
+                break;
+            }
             ide_atapi_cmd_read(s, lba, nb_sectors, 2048);
         }
         break;
@@ -1295,6 +1340,16 @@ static void ide_atapi_cmd(IDEState *s)
             lba = ube32_to_cpu(packet + 2);
             if (nb_sectors == 0) {
                 ide_atapi_cmd_ok(s);
+                break;
+            }
+            if (!media_present(s)) {
+                ide_atapi_cmd_error(s, SENSE_NOT_READY,
+                                    ASC_MEDIUM_NOT_PRESENT);
+                break;
+            }
+            if (((int64_t)lba + nb_sectors) > (s->nb_sectors >> 2)) {
+                ide_atapi_cmd_error(s, SENSE_ILLEGAL_REQUEST,
+                                    ASC_LOGICAL_BLOCK_OOR);
                 break;
             }
             transfer_request = packet[9];
@@ -1323,13 +1378,12 @@ static void ide_atapi_cmd(IDEState *s)
             unsigned int lba;
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
-            total_sectors >>= 2;
-            if (total_sectors == 0) {
+            if (!media_present(s)) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
                                     ASC_MEDIUM_NOT_PRESENT);
                 break;
             }
+            total_sectors = s->nb_sectors >> 2;
             lba = ube32_to_cpu(packet + 2);
             if (lba >= total_sectors) {
                 ide_atapi_cmd_error(s, SENSE_ILLEGAL_REQUEST,
@@ -1339,20 +1393,44 @@ static void ide_atapi_cmd(IDEState *s)
             ide_atapi_cmd_ok(s);
         }
         break;
+    case GPCMD_LOAD_UNLOAD:
     case GPCMD_START_STOP_UNIT:
         {
+            int loej = packet[4] & 2;
+            int start = packet[4] & 1;
+            if ((loej && !start) || (packet[0] == GPCMD_LOAD_UNLOAD && !start)) {
+                /* Guest requested eject */
+                int drive = (s == s->ide_if->drives[1]) ? 1 : 0;
+                printf("[ATAPI] Guest requested CD eject on drive %d\n", drive);
+                ide_change_cd(s->ide_if, drive, "");
+            }
             ide_atapi_cmd_ok(s);
+        }
+        break;
+    case GPCMD_GET_MEDIA_STATUS:
+        {
+            uint8_t status = 0;
+            if (media_present(s))
+                status |= 0x08; /* Media Present */
+            else
+                status |= 0x10; /* Door Open */
+            if (s->cdrom_changed)
+                status |= 0x04; /* Media Changed */
+            buf[0] = status;
+            buf[1] = 0;
+            ide_atapi_cmd_reply(s, 2, 2);
         }
         break;
     case GPCMD_MECHANISM_STATUS:
         {
             max_len = ube16_to_cpu(packet + 8);
-            cpu_to_ube16(buf, 0);
+            buf[0] = 0;
+            buf[1] = media_present(s) ? 0x00 : 0x10; /* Door open bit */
             /* no current LBA */
             buf[2] = 0;
             buf[3] = 0;
             buf[4] = 0;
-            buf[5] = 1;
+            buf[5] = media_present(s) ? 1 : 0;
             cpu_to_ube16(buf + 6, 0);
             ide_atapi_cmd_reply(s, 8, max_len);
         }
@@ -1362,13 +1440,12 @@ static void ide_atapi_cmd(IDEState *s)
             int format, msf, start_track, len;
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
-            total_sectors >>= 2;
-            if (total_sectors == 0) {
+            if (!media_present(s)) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
                                     ASC_MEDIUM_NOT_PRESENT);
                 break;
             }
+            total_sectors = s->nb_sectors >> 2;
             max_len = ube16_to_cpu(packet + 7);
             format = packet[9] >> 6;
             msf = (packet[1] >> 1) & 1;
@@ -1406,13 +1483,12 @@ static void ide_atapi_cmd(IDEState *s)
         {
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
-            total_sectors >>= 2;
-            if (total_sectors == 0) {
+            if (!media_present(s)) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
                                     ASC_MEDIUM_NOT_PRESENT);
                 break;
             }
+            total_sectors = s->nb_sectors >> 2;
             /* NOTE: it is really the number of sectors minus 1 */
             cpu_to_ube32(buf, total_sectors - 1);
             cpu_to_ube32(buf + 4, 2048);
@@ -1859,6 +1935,7 @@ static IDEState *ide_cddrive_init(IDEIFState *ide_if, BlockDevice *bs)
     s->ide_if = ide_if;
     s->bs = bs;
     s->drive_kind = IDE_CD;
+    s->nb_sectors = (bs && bs->get_sector_count) ? bs->get_sector_count(bs) : 0;
 
     /* ide regs */
     s->feature = 0;
@@ -1971,6 +2048,11 @@ static int bf_write_async(BlockDevice *bs,
     case BF_MODE_RW:
         fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
         fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
+        /* Flush each write out of the stdio buffer: if the emulator is killed
+           while a multi-sector write is buffered, the image is left with a
+           partially applied write (which is what corrupts the guest's
+           filesystem / registry). */
+        fflush(bf->f);
         ret = 0;
         break;
     case BF_MODE_SNAPSHOT:
@@ -1996,6 +2078,14 @@ static int bf_write_async(BlockDevice *bs,
     return ret;
 }
 
+static int bf_flush(BlockDevice *bs)
+{
+    BlockDeviceFile *bf = bs->opaque;
+    if (bf->f)
+        fflush(bf->f);
+    return 0;
+}
+
 static BlockDevice *block_device_init(const char *filename,
                                       BlockDeviceModeEnum mode)
 {
@@ -2004,6 +2094,22 @@ static BlockDevice *block_device_init(const char *filename,
     int64_t file_size;
     FILE *f;
     const char *mode_str;
+
+    if (!filename || filename[0] == '\0') {
+        bs = pcmalloc(sizeof(*bs));
+        bf = pcmalloc(sizeof(*bf));
+        memset(bs, 0, sizeof(*bs));
+        memset(bf, 0, sizeof(*bf));
+        bf->mode = mode;
+        bf->nb_sectors = 0;
+        bf->f = NULL;
+        bs->opaque = bf;
+        bs->get_sector_count = bf_get_sector_count;
+        bs->read_async = bf_read_async;
+        bs->write_async = bf_write_async;
+        bs->flush = bf_flush;
+        return bs;
+    }
 
     if (mode == BF_MODE_RW) {
         mode_str = "r+b";
@@ -2058,6 +2164,7 @@ static BlockDevice *block_device_init(const char *filename,
     }
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
+    bs->flush = bf_flush;
     return bs;
 }
 
@@ -2282,6 +2389,128 @@ static BlockDevice *block_device_init_ciso(const char *filename)
 }
 #endif
 
+/* ---- virtual CD-ROM backed by a host shared folder (streaming ISO9660) ----
+ *
+ * Instead of a disc image file, the medium is synthesised on the fly from a
+ * host directory.  Only the ISO9660 metadata is kept in RAM; file contents
+ * are read from the host/SD files on demand, so a large shared folder costs
+ * only a few tens of KB.  Read-only medium: writes always fail.
+ *
+ * Paths of the currently mounted images (hda / fda / cdb) are registered via
+ * ide_set_vcd_forbidden() so they can never end up inside the virtual disc.
+ */
+
+static char vcd_forbidden_buf[3][512];
+static const char *vcd_forbidden[4];
+
+void ide_set_vcd_forbidden(const char *hda, const char *fda, const char *cdb)
+{
+    const char *src[3];
+    int n = 0;
+
+    src[0] = hda;
+    src[1] = fda;
+    src[2] = cdb;
+    for (int i = 0; i < 3; i++) {
+        if (src[i] && src[i][0]) {
+            strncpy(vcd_forbidden_buf[n], src[i], sizeof(vcd_forbidden_buf[n]) - 1);
+            vcd_forbidden_buf[n][sizeof(vcd_forbidden_buf[n]) - 1] = 0;
+            vcd_forbidden[n] = vcd_forbidden_buf[n];
+            n++;
+        }
+    }
+    vcd_forbidden[n] = NULL;
+}
+
+typedef struct BlockDeviceVCD {
+    ISOFolder *fs;
+    int64_t nb_sectors;
+    char folder[512];
+} BlockDeviceVCD;
+
+static int64_t vcd_get_sector_count(BlockDevice *bs)
+{
+    BlockDeviceVCD *bf = bs->opaque;
+    return bf->nb_sectors;
+}
+
+static int vcd_read_async(BlockDevice *bs,
+                          uint64_t sector_num, uint8_t *buf, int n,
+                          BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    BlockDeviceVCD *bf = bs->opaque;
+    if (!bf->fs)
+        return -1;
+    if (isofs_read(bf->fs, sector_num * SECTOR_SIZE, buf,
+                   (uint32_t)n * SECTOR_SIZE) != 0) {
+        memset(buf, 0, (size_t)n * SECTOR_SIZE);
+        return -1;
+    }
+    /* synchronous read */
+    return 0;
+}
+
+static int vcd_write_async(BlockDevice *bs,
+                           uint64_t sector_num, const uint8_t *buf, int n,
+                           BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    return -1; /* read-only medium */
+}
+
+static int vcd_flush(BlockDevice *bs)
+{
+    return 0;
+}
+
+static void vcd_set_folder(BlockDeviceVCD *bf, const char *folder)
+{
+    if (bf->fs) {
+        isofs_close(bf->fs);
+        bf->fs = NULL;
+    }
+    bf->nb_sectors = 0;
+    bf->folder[0] = 0;
+    if (!folder || !folder[0])
+        return;
+    bf->fs = isofs_open(folder, vcd_forbidden);
+    if (!bf->fs)
+        return;
+    strncpy(bf->folder, folder, sizeof(bf->folder) - 1);
+    bf->nb_sectors = isofs_size(bf->fs) / SECTOR_SIZE;
+}
+
+static BlockDevice *block_device_init_vcd(const char *folder)
+{
+    BlockDevice *bs = pcmalloc(sizeof(*bs));
+    BlockDeviceVCD *bf = pcmalloc(sizeof(*bf));
+
+    memset(bs, 0, sizeof(*bs));
+    memset(bf, 0, sizeof(*bf));
+    vcd_set_folder(bf, folder);
+    /* An empty name yields a present-but-empty drive (no media): the guest
+     * enumerates the ATAPI unit at POST and media is inserted later. */
+    if (folder && folder[0] && !bf->fs)
+        return NULL;
+
+    bs->opaque = bf;
+    bs->get_sector_count = vcd_get_sector_count;
+    bs->get_chs = NULL;
+    bs->read_async = vcd_read_async;
+    bs->write_async = vcd_write_async;
+    bs->flush = vcd_flush;
+    return bs;
+}
+
+static int path_is_dir(const char *path)
+{
+    struct stat st;
+    if (!path || !path[0])
+        return 0;
+    if (stat(path, &st) != 0)
+        return 0;
+    return S_ISDIR(st.st_mode);
+}
+
 IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq, int level))
 {
     IDEIFState *s;
@@ -2295,6 +2524,11 @@ IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq,
 
     s->cur_drive = s->drives[0];
     return s;
+}
+
+int ide_drive_present(IDEIFState *s, int drive)
+{
+    return s && s->drives[drive] != NULL;
 }
 
 int ide_attach(IDEIFState *s, int drive, const char *filename)
@@ -2316,22 +2550,43 @@ int ide_attach(IDEIFState *s, int drive, const char *filename)
 int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
 {
     assert(MAX_MULT_SECTORS >= 4);
+    BlockDevice *bs = NULL;
+
+    if (!filename || !filename[0] || path_is_dir(filename)) {
+        /* A host shared folder exposed as a virtual CD-ROM.  An empty name
+         * creates a present-but-empty drive so the guest can enumerate the
+         * unit at POST and later receive media via ide_change_cd(). */
+        bs = block_device_init_vcd(filename);
+    } else {
 #ifdef IDE_ENABLE_CISO
-    BlockDevice *bs = block_device_init_ciso(filename);
-#else
-    BlockDevice *bs = block_device_init(filename, BF_MODE_RW);
+        if (filename && filename[0])
+            bs = block_device_init_ciso(filename);
 #endif
+        if (!bs)
+            bs = block_device_init(filename, BF_MODE_RO);
+    }
+    if (!bs)
+        return -1;
     s->drives[drive] = ide_cddrive_init(s, bs);
     return 0;
 }
 
 static void block_device_reinit(BlockDevice *bs, const char *filename)
 {
+    if (!bs)
+        return;
+    if (bs->get_sector_count == vcd_get_sector_count) {
+        /* virtual folder CD: reload (or eject with an empty filename) */
+        BlockDeviceVCD *bf = bs->opaque;
+        vcd_set_folder(bf, filename);
+        return;
+    }
 #ifdef IDE_ENABLE_CISO
     if (bs->get_sector_count == ciso_get_sector_count) {
         BlockDeviceCISO *bf = bs->opaque;
         __ciso_close(bf);
-        __ciso_open(bf, filename);
+        if (filename && filename[0])
+            __ciso_open(bf, filename);
         return;
     }
 #endif
@@ -2341,8 +2596,17 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
     }
     BlockDeviceFile *bf = bs->opaque;
 
-    if (bf->mode != BF_MODE_RO || bs->get_chs) {
+    if ((bf->mode != BF_MODE_RO && bf->mode != BF_MODE_RW) || bs->get_chs) {
         fprintf(stderr, "block_device_reinit: not supported device mode\n");
+        return;
+    }
+
+    if (!filename || filename[0] == '\0') {
+        if (bf->f) {
+            fclose(bf->f);
+            bf->f = NULL;
+        }
+        bf->nb_sectors = 0;
         return;
     }
 
@@ -2353,6 +2617,11 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
     f = fopen(filename, mode_str);
     if (!f) {
         fprintf(stderr, "block_device_reinit: open failed: %s\n", filename);
+        if (bf->f) {
+            fclose(bf->f);
+            bf->f = NULL;
+        }
+        bf->nb_sectors = 0;
         return;
     }
 
@@ -2366,15 +2635,42 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
     bf->start_offset = 0;
 }
 
+void ide_set_cd_change_cb(IDEIFState *s, ide_cd_change_cb_t cb, void *opaque)
+{
+    if (s) {
+        s->cd_change_cb = cb;
+        s->cd_change_opaque = opaque;
+    }
+}
+
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
 {
+    if (!sif)
+        return;
     IDEState *s = sif->drives[drive];
+    if (!s && filename && filename[0]) {
+        ide_attach_cd(sif, drive, filename);
+        s = sif->drives[drive];
+    }
     if (s && s->drive_kind == IDE_CD) {
-        block_device_reinit(s->bs, filename);
+        /* An ISO image and a host shared folder are different block-device
+           types and cannot be swapped in place; re-attach the unit whenever
+           the medium kind changes (or the drive has no backing yet). */
+        int new_is_vcd = (!filename || !filename[0] || path_is_dir(filename));
+        int cur_is_vcd = s->bs && s->bs->get_sector_count == vcd_get_sector_count;
+        if (new_is_vcd != cur_is_vcd || !s->bs) {
+            ide_attach_cd(sif, drive, filename);
+            s = sif->drives[drive];
+        } else {
+            block_device_reinit(s->bs, filename);
+        }
+        s->nb_sectors = (s->bs && s->bs->get_sector_count) ? s->bs->get_sector_count(s->bs) : 0;
         s->sense_key = SENSE_UNIT_ATTENTION;
         s->asc = ASC_MEDIUM_MAY_HAVE_CHANGED;
         s->cdrom_changed = 1;
         ide_set_irq(s);
+        if (sif->cd_change_cb)
+            sif->cd_change_cb(sif->cd_change_opaque, drive, filename);
     }
 }
 

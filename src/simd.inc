@@ -1,12 +1,5 @@
-#ifndef USE_AMD64
 #define MODSIB(_) TRY(modsib(cpu, adsz16, mod, rm, &addr, &curr_seg))
 #define IN_AMD64(...)
-#else
-#define MODSIB(_o) TRY(modsib_off(cpu, adsz32, rex, mod, rm, &addr, _o))
-#define IN_AMD64(...) __VA_ARGS__
-#define code16 false
-#define adsz16 false
-#endif
 #ifdef SIMD_i386ins_def
 #ifdef I2
 // MMX
@@ -734,18 +727,6 @@ static int32_t trunci32(double val)
 {
 	return val < 2147483648.0 && val >= -2147483648.0 ? (int32_t) val : 0x80000000;
 }
-
-#ifdef USE_AMD64
-static int64_t trunci64f(float val)
-{
-	return val < 9223372036854775808.0 && val >= -9223372036854775808.0 ? (int64_t) val : 0x8000000000000000ll;
-}
-
-static int64_t trunci64(double val)
-{
-	return val < 9223372036854775808.0 && val >= -9223372036854775808.0 ? (int64_t) val : 0x8000000000000000ll;
-}
-#endif
 
 #define SIMD_CVTS2I_D2I() \
 	if (cpu->cr0 & 0xc) THROW0(EX_NM); \
@@ -2787,11 +2768,7 @@ uint16_t *fpu_xmm_get_u16(FPU *fpu, int i)
 
 bool fpu_xmm_grp15(FPU *fpu, void *cpu, int op, int seg, uword addr)
 {
-#ifndef USE_AMD64
 #define N_XMM 8
-#else
-#define N_XMM 16
-#endif
 	if (!fpu) {
 		cpu_setexc(cpu, 6, 0);
 		return false;

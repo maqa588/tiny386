@@ -2,12 +2,13 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-# Board selection: P4 Only target default jc4880p443.
+# Board selection. Default is the WT0132P4-A1 (ESP32-P4) core module; other
+# boards (s31_wroom3, ...) can be picked with -DBOARD=<name>.
 if(NOT DEFINED BOARD)
     if(DEFINED ENV{BOARD})
         set(BOARD $ENV{BOARD})
     else()
-        set(BOARD "jc4880p443")
+        set(BOARD "wt0132p4_a1")
     endif()
 endif()
 # Always sync sdkconfig from the board-specific file.

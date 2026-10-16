@@ -4,70 +4,400 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../vga.h" // XXX: for BPP definition
-
 #include "../misc.h"
 #include "../ide.h"
+#include "../pc.h"
+
+#define OSD_MAX_FILES 128
+
+typedef struct {
+	char name[64];
+	int is_dir;
+	int64_t size;
+} OSDFileEntry;
+
+enum {
+	BROWSE_TARGET_NONE = 0,
+	BROWSE_TARGET_FDA  = 1,
+	BROWSE_TARGET_CDB  = 2,
+	BROWSE_TARGET_CDC  = 3,	/* virtual CD-ROM from a host shared folder */
+};
 
 struct OSD {
 	mu_Context ctx;
+	PC *pc;
 	EMULINK *emulink;
 	IDEIFState *ide, *ide2;
 	void *console;
+
+	/* File browser state */
+	int browse_target;
+	char current_dir[256];
+	OSDFileEntry files[OSD_MAX_FILES];
+	int file_count;
 };
+
+static void format_size(char *buf, size_t bufsz, int64_t bytes)
+{
+	if (bytes <= 0) {
+		snprintf(buf, bufsz, "0 B");
+	} else if (bytes < 1024) {
+		snprintf(buf, bufsz, "%lld B", (long long)bytes);
+	} else if (bytes < 1024 * 1024) {
+		snprintf(buf, bufsz, "%.1f KB", (double)bytes / 1024.0);
+	} else if (bytes < 1024LL * 1024 * 1024) {
+		snprintf(buf, bufsz, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+	} else {
+		snprintf(buf, bufsz, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+	}
+}
+
+static const char *get_basename(const char *path)
+{
+	if (!path || !path[0]) return "";
+	const char *slash = strrchr(path, '/');
+	return slash ? slash + 1 : path;
+}
+
+static int is_image_file(const char *name)
+{
+	const char *dot = strrchr(name, '.');
+	if (!dot) return 0;
+	if (strcasecmp(dot, ".img") == 0 ||
+	    strcasecmp(dot, ".iso") == 0 ||
+	    strcasecmp(dot, ".bin") == 0 ||
+	    strcasecmp(dot, ".ima") == 0 ||
+	    strcasecmp(dot, ".flp") == 0 ||
+	    strcasecmp(dot, ".vhd") == 0)
+		return 1;
+	return 0;
+}
+
+static int compare_entries(const void *a, const void *b)
+{
+	const OSDFileEntry *ea = a;
+	const OSDFileEntry *eb = b;
+	if (ea->is_dir != eb->is_dir)
+		return eb->is_dir - ea->is_dir; /* directories first */
+	return strcasecmp(ea->name, eb->name);
+}
+
+static void osd_scan_dir(OSD *osd)
+{
+	osd->file_count = 0;
+
+	DIR *d = opendir(osd->current_dir[0] ? osd->current_dir : ".");
+	if (!d) {
+#if defined(BUILD_ESP32)
+		strncpy(osd->current_dir, "/sdcard", sizeof(osd->current_dir) - 1);
+#else
+		strncpy(osd->current_dir, ".", sizeof(osd->current_dir) - 1);
+#endif
+		d = opendir(osd->current_dir);
+		if (!d) return;
+	}
+
+	/* Add ".." if not at root */
+	if (strcmp(osd->current_dir, "/") != 0 &&
+#if defined(BUILD_ESP32)
+	    strcmp(osd->current_dir, "/sdcard") != 0 &&
+#endif
+	    strcmp(osd->current_dir, ".") != 0) {
+		strncpy(osd->files[osd->file_count].name, "..", sizeof(osd->files[0].name) - 1);
+		osd->files[osd->file_count].is_dir = 1;
+		osd->files[osd->file_count].size = 0;
+		osd->file_count++;
+	}
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL && osd->file_count < OSD_MAX_FILES) {
+		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+			continue;
+		if (ent->d_name[0] == '.')
+			continue;
+
+		char fullpath[512];
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->current_dir, ent->d_name);
+
+		struct stat st;
+		int is_dir = 0;
+		int64_t size = 0;
+		if (stat(fullpath, &st) == 0) {
+			if (S_ISDIR(st.st_mode))
+				is_dir = 1;
+			else
+				size = st.st_size;
+		}
+
+		if (is_dir || is_image_file(ent->d_name)) {
+			strncpy(osd->files[osd->file_count].name, ent->d_name, sizeof(osd->files[0].name) - 1);
+			osd->files[osd->file_count].is_dir = is_dir;
+			osd->files[osd->file_count].size = size;
+			osd->file_count++;
+		}
+	}
+	closedir(d);
+
+	if (osd->file_count > 1) {
+		int start = (strcmp(osd->files[0].name, "..") == 0) ? 1 : 0;
+		qsort(&osd->files[start], osd->file_count - start, sizeof(OSDFileEntry), compare_entries);
+	}
+}
+
+static void osd_cd_up(OSD *osd)
+{
+	char *slash = strrchr(osd->current_dir, '/');
+	if (slash) {
+		if (slash == osd->current_dir)
+			osd->current_dir[1] = '\0';
+		else
+			*slash = '\0';
+	} else {
+		strcpy(osd->current_dir, ".");
+	}
+	osd_scan_dir(osd);
+}
+
+static void osd_cd_into(OSD *osd, const char *name)
+{
+	char newpath[256];
+	if (strcmp(osd->current_dir, ".") == 0)
+		snprintf(newpath, sizeof(newpath), "%s", name);
+	else if (strcmp(osd->current_dir, "/") == 0)
+		snprintf(newpath, sizeof(newpath), "/%s", name);
+	else
+		snprintf(newpath, sizeof(newpath), "%s/%s", osd->current_dir, name);
+	strncpy(osd->current_dir, newpath, sizeof(osd->current_dir) - 1);
+	osd_scan_dir(osd);
+}
+
+static void osd_select_file(OSD *osd, const char *name)
+{
+	char fullpath[256];
+	if (strcmp(osd->current_dir, ".") == 0)
+		snprintf(fullpath, sizeof(fullpath), "%s", name);
+	else if (strcmp(osd->current_dir, "/") == 0)
+		snprintf(fullpath, sizeof(fullpath), "/%s", name);
+	else
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->current_dir, name);
+
+	struct stat st;
+	int64_t size = 0;
+	if (stat(fullpath, &st) == 0)
+		size = st.st_size;
+
+	if (osd->browse_target == BROWSE_TARGET_FDA) {
+		if (osd->emulink)
+			emulink_attach_floppy(osd->emulink, 0, fullpath);
+		if (osd->pc) {
+			strncpy(osd->pc->fda_path, fullpath, sizeof(osd->pc->fda_path) - 1);
+			osd->pc->fda_size = size;
+		}
+	} else if (osd->browse_target == BROWSE_TARGET_CDB) {
+		if (osd->ide)
+			ide_change_cd(osd->ide, 1, fullpath);
+		if (osd->pc) {
+			strncpy(osd->pc->cdb_path, fullpath, sizeof(osd->pc->cdb_path) - 1);
+			osd->pc->cdb_size = size;
+		}
+	}
+	osd->browse_target = BROWSE_TARGET_NONE;
+}
+
+/* Mount the browsed directory as the virtual CD-ROM (cdc).  It shares the
+   primary slave slot with the ISO-image drive (cdb), since Win9x drives only
+   the primary IDE channel: mounting the folder ejects any ISO there.  The
+   currently mounted images are registered as forbidden so the synthesised
+   disc can never include the system image, the floppy image or the CD ISO. */
+static void osd_mount_folder(OSD *osd)
+{
+	if (osd->pc)
+		ide_set_vcd_forbidden(osd->pc->hda_path, osd->pc->fda_path,
+				      osd->pc->cdb_path);
+	if (osd->ide)
+		ide_change_cd(osd->ide, 1, osd->current_dir);
+	/* pc->cdc_path is updated by the pc CD-change callback on success */
+	osd->browse_target = BROWSE_TARGET_NONE;
+}
 
 static void do_window(mu_Context *ctx, struct OSD *osd)
 {
-	if (mu_begin_window_ex(ctx, "Tiny386 Control Panel",
-			       mu_rect(40, 40, 320, 240),
-			       MU_OPT_NOCLOSE)) {
-		static char buf[2][128];
-		mu_layout_row(ctx, 3, (int[]) { 54, -70, -1 }, 0);
-		for (int i = 0; i < 2; i++) {
-			mu_push_id(ctx, &i, sizeof(i));
-			char label[4] = "fd ";
-			label[2] = 'a' + i;
-			mu_label(ctx, label);
-			if (mu_textbox(ctx, buf[i], sizeof(buf[0])) & MU_RES_SUBMIT) {
-//				mu_set_focus(ctx, ctx->last_id);
+	if (osd->browse_target != BROWSE_TARGET_NONE) {
+		/* File Browser View */
+		const char *title = (osd->browse_target == BROWSE_TARGET_FDA) ?
+			"Select Floppy (fda)" :
+			(osd->browse_target == BROWSE_TARGET_CDC) ?
+			"Select Shared Folder (cdc)" : "Select CD-ROM (cdb)";
+		if (mu_begin_window_ex(ctx, title, mu_rect(20, 20, 360, 310), MU_OPT_NOCLOSE)) {
+			char path_lbl[300];
+			snprintf(path_lbl, sizeof(path_lbl), "Path: %s", osd->current_dir);
+			mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+			mu_label(ctx, path_lbl);
+
+			mu_layout_row(ctx, 3, (int[]) { 75, 75, 75 }, 0);
+			if (mu_button(ctx, "Up (..)"))
+				osd_cd_up(osd);
+			if (mu_button(ctx, "Refresh"))
+				osd_scan_dir(osd);
+			if (mu_button(ctx, "Cancel"))
+				osd->browse_target = BROWSE_TARGET_NONE;
+
+			if (osd->browse_target == BROWSE_TARGET_CDC) {
+				char mnt_lbl[300];
+				snprintf(mnt_lbl, sizeof(mnt_lbl), "Mount This Folder: %s",
+					 osd->current_dir);
+				mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+				if (mu_button(ctx, mnt_lbl))
+					osd_mount_folder(osd);
 			}
-			if (mu_button(ctx, "Submit")) {
-				if (osd->emulink) {
-					if (buf[i][0] == 0)
-						emulink_attach_floppy(osd->emulink, i, NULL);
-					else
-						emulink_attach_floppy(osd->emulink, i, buf[i]);
+
+			mu_layout_row(ctx, 1, (int[]) { -1 }, 200);
+			mu_begin_panel(ctx, "file_panel");
+			for (int i = 0; i < osd->file_count; i++) {
+				/* the shared-folder CD is directory-based: browse dirs only */
+				if (osd->browse_target == BROWSE_TARGET_CDC &&
+				    !osd->files[i].is_dir)
+					continue;
+				mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+				if (osd->files[i].is_dir) {
+					char label[100];
+					snprintf(label, sizeof(label), "[DIR] %s", osd->files[i].name);
+					if (mu_button(ctx, label)) {
+						if (strcmp(osd->files[i].name, "..") == 0)
+							osd_cd_up(osd);
+						else
+							osd_cd_into(osd, osd->files[i].name);
+					}
+				} else {
+					char sz_buf[32];
+					format_size(sz_buf, sizeof(sz_buf), osd->files[i].size);
+					char label[120];
+					snprintf(label, sizeof(label), "%s (%s)", osd->files[i].name, sz_buf);
+					if (mu_button(ctx, label)) {
+						osd_select_file(osd, osd->files[i].name);
+					}
 				}
 			}
-			mu_pop_id(ctx);
+			mu_end_panel(ctx);
+			mu_end_window(ctx);
+		}
+		return;
+	}
+
+	/* Main Control Panel View */
+	if (mu_begin_window_ex(ctx, "Tiny386 Control Panel",
+			       mu_rect(30, 20, 360, 400),
+			       MU_OPT_NOCLOSE)) {
+
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, "--- Storage Drives ---");
+
+		/* HDA: Primary Master HDD (Read-only / Locked) */
+		char hda_info[200];
+		if (osd->pc && osd->pc->hda_path[0]) {
+			char sz_buf[32];
+			format_size(sz_buf, sizeof(sz_buf), osd->pc->hda_size);
+			snprintf(hda_info, sizeof(hda_info), "hda: %s (%s) [Locked]",
+				 get_basename(osd->pc->hda_path), sz_buf);
+		} else {
+			snprintf(hda_info, sizeof(hda_info), "hda: [None]");
+		}
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, hda_info);
+
+		/* FDA: Floppy Drive A */
+		char fda_info[200];
+		if (osd->pc && osd->pc->fda_path[0]) {
+			char sz_buf[32];
+			format_size(sz_buf, sizeof(sz_buf), osd->pc->fda_size);
+			snprintf(fda_info, sizeof(fda_info), "fda: %s (%s)",
+				 get_basename(osd->pc->fda_path), sz_buf);
+		} else {
+			snprintf(fda_info, sizeof(fda_info), "fda: [Empty / No Floppy]");
+		}
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, fda_info);
+
+		mu_layout_row(ctx, 2, (int[]) { 110, 80 }, 0);
+		if (mu_button(ctx, "Mount Floppy")) {
+			osd->browse_target = BROWSE_TARGET_FDA;
+			osd_scan_dir(osd);
+		}
+		if (mu_button(ctx, "Eject fda")) {
+			if (osd->emulink)
+				emulink_attach_floppy(osd->emulink, 0, NULL);
+			if (osd->pc) {
+				osd->pc->fda_path[0] = '\0';
+				osd->pc->fda_size = 0;
+			}
 		}
 
-		static char buf2[4][128];
-		for (int i = 0; i < 4; i++) {
-			int iid = 2 + i;
-			mu_push_id(ctx, &iid, sizeof(iid));
-			char label[4] = "cd ";
-			label[2] = 'a' + i;
-			mu_label(ctx, label);
-			if (mu_textbox(ctx, buf2[i], sizeof(buf2[0])) & MU_RES_SUBMIT) {
-//				mu_set_focus(ctx, ctx->last_id);
-			}
-			if (mu_button(ctx, "Submit")) {
-				IDEIFState *ide;
-				if (i < 2) {
-					ide = osd->ide;
-				} else {
-					ide = osd->ide2;
-				}
-				if (ide)
-					ide_change_cd(ide, i % 2, buf2[i]);
-			}
-			mu_pop_id(ctx);
+		/* CDB: CD-ROM Drive (primary slave, ISO image) */
+		char cdb_info[200];
+		if (osd->pc && osd->pc->cdb_path[0]) {
+			char sz_buf[32];
+			format_size(sz_buf, sizeof(sz_buf), osd->pc->cdb_size);
+			snprintf(cdb_info, sizeof(cdb_info), "cdb: %s (%s)",
+				 get_basename(osd->pc->cdb_path), sz_buf);
+		} else {
+			snprintf(cdb_info, sizeof(cdb_info), "cdb: [Empty / No Disc]");
 		}
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, cdb_info);
+
+		mu_layout_row(ctx, 2, (int[]) { 110, 80 }, 0);
+		if (mu_button(ctx, "Mount CD/ISO")) {
+			osd->browse_target = BROWSE_TARGET_CDB;
+			osd_scan_dir(osd);
+		}
+		if (mu_button(ctx, "Eject cdb")) {
+			if (osd->ide)
+				ide_change_cd(osd->ide, 1, "");
+			if (osd->pc) {
+				osd->pc->cdb_path[0] = '\0';
+				osd->pc->cdb_size = 0;
+			}
+		}
+
+		/* CDC: virtual CD-ROM from a host shared folder (primary slave,
+		   mutually exclusive with cdb) */
+		char cdc_info[220];
+		if (osd->pc && osd->pc->cdc_path[0]) {
+			snprintf(cdc_info, sizeof(cdc_info), "cdc: %s [Shared Folder]",
+				 get_basename(osd->pc->cdc_path));
+		} else {
+			snprintf(cdc_info, sizeof(cdc_info), "cdc: [Empty / No Disc]");
+		}
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, cdc_info);
+
+		mu_layout_row(ctx, 2, (int[]) { 130, 90 }, 0);
+		if (mu_button(ctx, "Mount Folder...")) {
+			osd->browse_target = BROWSE_TARGET_CDC;
+			osd_scan_dir(osd);
+		}
+		if (mu_button(ctx, "Eject cdc")) {
+			if (osd->ide)
+				ide_change_cd(osd->ide, 1, "");
+			if (osd->pc) {
+				osd->pc->cdc_path[0] = '\0';
+				osd->pc->cdc_size = 0;
+			}
+		}
+
+		/* System Controls */
+		mu_layout_row(ctx, 1, (int[]) { -1 }, 0);
+		mu_label(ctx, "--- System Controls ---");
 
 		if (osd->console) {
 			void __attribute__((weak)) console_send_kbd(void *opaque, int keypress, int keycode);
+			void __attribute__((weak)) console_power_off(void *opaque);
+			void __attribute__((weak)) console_trigger_suspend(void *opaque);
 			if (console_send_kbd) {
 				mu_layout_row(ctx, 3, (int[]) { 75, 75, 75 }, 0);
 				if (mu_button(ctx, "Ctrl+Alt+Del")) {
@@ -91,10 +421,19 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 					console_send_kbd(osd->console, 0, 0x1d);
 				}
 			}
+			mu_layout_row(ctx, 2, (int[]) { 116, 116 }, 0);
+			if (console_trigger_suspend && mu_button(ctx, "Sleep / Suspend")) {
+				console_trigger_suspend(osd->console);
+			}
+			if (console_power_off && mu_button(ctx, "Power Off")) {
+				console_power_off(osd->console);
+			}
 		}
+
 		mu_end_window(ctx);
 	}
 }
+
 
 static void process_frame(mu_Context *ctx, struct OSD *osd)
 {
@@ -294,13 +633,21 @@ static void render(mu_Context *ctx,
 OSD *osd_init()
 {
 	OSD *osd = malloc(sizeof(OSD));
-	osd->emulink = NULL;
-	osd->ide = osd->ide2 = NULL;
-	osd->console = NULL;
+	memset(osd, 0, sizeof(OSD));
+#if defined(BUILD_ESP32)
+	strncpy(osd->current_dir, "/sdcard", sizeof(osd->current_dir) - 1);
+#else
+	strncpy(osd->current_dir, ".", sizeof(osd->current_dir) - 1);
+#endif
 	mu_init(&(osd->ctx));
 	osd->ctx.text_height = text_height;
 	osd->ctx.text_width = text_width;
 	return osd;
+}
+
+void osd_attach_pc(OSD *osd, void *pc)
+{
+	osd->pc = pc;
 }
 
 void osd_attach_emulink(OSD *osd, void *emulink)
@@ -318,6 +665,7 @@ void osd_attach_console(OSD *osd, void *console)
 {
 	osd->console = console;
 }
+
 
 void osd_handle_mouse_motion(OSD *osd, int x, int y)
 {

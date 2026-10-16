@@ -31,7 +31,15 @@ typedef struct IDEIFState IDEIFState;
 IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq, int level));
 int ide_attach(IDEIFState *s, int drive, const char *filename);
 int ide_attach_cd(IDEIFState *s, int drive, const char *filename);
+/* Whether a drive unit is currently present in the given channel slot. */
+int ide_drive_present(IDEIFState *s, int drive);
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename);
+typedef void (*ide_cd_change_cb_t)(void *opaque, int drive, const char *filename);
+void ide_set_cd_change_cb(IDEIFState *s, ide_cd_change_cb_t cb, void *opaque);
+
+/* Register the paths of the currently mounted images so a virtual CD-ROM
+ * built from a host shared folder can never include them. */
+void ide_set_vcd_forbidden(const char *hda, const char *fda, const char *cdb);
 
 void ide_data_writew(void *opaque, uint32_t val);
 uint32_t ide_data_readw(void *opaque);

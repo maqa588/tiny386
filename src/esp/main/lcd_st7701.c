@@ -179,7 +179,7 @@ esp_err_t bsp_display_brightness_set(uint8_t brightness_percent)
 	return ledc_update_duty(LEDC_LOW_SPEED_MODE, CONFIG_BSP_JC4880P443C_BACKLIGHT_CHANNEL);
 }
 
-void pc_vga_step(void *o);
+void pc_vga_render(void *o);
 
 /**
  * @brief Zero-copy Cache Synchronization for MIPI-DSI Framebuffer
@@ -366,8 +366,9 @@ void vga_task(void *arg)
 		xEventGroupWaitBits(global_event_group, BIT0, pdFALSE, pdFALSE, portMAX_DELAY);
 		while (1) {
 			int64_t frame_start = esp_timer_get_time();
-			if (globals.pc) {
-				pc_vga_step(globals.pc);
+			if (globals.pc && globals.vga_frame_ready) {
+				globals.vga_frame_ready = 0;
+				pc_vga_render(globals.pc);
 			}
 			if (globals.vga_dirty) {
 				globals.vga_dirty = 0;
@@ -482,8 +483,9 @@ void vga_task(void *arg)
 
 	while (1) {
 		int64_t frame_start = esp_timer_get_time();
-		if (globals.pc) {
-			pc_vga_step(globals.pc);
+		if (globals.pc && globals.vga_frame_ready) {
+			globals.vga_frame_ready = 0;
+			pc_vga_render(globals.pc);
 		}
 		if (globals.vga_dirty) {
 			globals.vga_dirty = 0;

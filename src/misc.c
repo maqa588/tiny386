@@ -15,6 +15,7 @@ void CaptureKeyboardInput()
 
 static int ReadKBByte()
 {
+	if (!uart_is_driver_installed(0)) return -1;
 	char data;
 	if (uart_read_bytes(0, &data, 1, 20 / portTICK_PERIOD_MS) > 0) {
 		return data;
@@ -24,6 +25,7 @@ static int ReadKBByte()
 
 static int IsKBHit()
 {
+	if (!uart_is_driver_installed(0)) return 0;
 	size_t len;
 	if (uart_get_buffered_data_len(0, &len) == ESP_OK) {
 		if (len)
@@ -96,6 +98,7 @@ void CaptureKeyboardInput()
 
 static int ReadKBByte()
 {
+	if (!uart_is_driver_installed(0)) return -1;
 	char data;
 	if (uart_read_bytes(0, &data, 1, 20 / portTICK_PERIOD_MS) > 0) {
 		return data;
@@ -105,6 +108,7 @@ static int ReadKBByte()
 
 static int IsKBHit()
 {
+	if (!uart_is_driver_installed(0)) return 0;
 	size_t len;
 	if (uart_get_buffered_data_len(0, &len) == ESP_OK) {
 		if (len)
@@ -191,6 +195,9 @@ CMOS *cmos_init(long mem_size, int irq, void *pic, void (*set_irq)(void *pic, in
 	c->data[12] = 0x00;
 	c->data[13] = 0x80;
 	c->data[14] = 0x00; // Diagnostic status: 0 = OK
+
+	/* Floppy drive types (0x10): Drive 0 = 1.44 MB 3.5" (0x40) */
+	c->data[0x10] = 0x40;
 
 	/* Equipment byte 0x14: 1 floppy, 80x25 color, math coprocessor */
 	c->data[0x14] = 0x2d;
@@ -501,6 +508,7 @@ struct EMULINK {
 	// fake floppy drive
 	FILE *fdd[2];
 	int fdfmti[2];
+	int changed[2];
 };
 
 EMULINK *emulink_init()
@@ -508,6 +516,8 @@ EMULINK *emulink_init()
 	EMULINK *e = malloc(sizeof(EMULINK));
 	memset(e, 0, sizeof(EMULINK));
 	e->cmd = -1;
+	e->changed[0] = 1;
+	e->changed[1] = 1;
 	return e;
 }
 
@@ -518,10 +528,17 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
 		}
-		if (filename)
-			e->fdd[i] = fopen(filename, "r+b");
+		e->changed[i] = 1;
+		if (!filename || filename[0] == '\0') {
+			e->fdfmti[i] = 0;
+			return 0; /* successfully detached / empty drive */
+		}
+		e->fdd[i] = fopen(filename, "r+b");
+		if (!e->fdd[i])
+			e->fdd[i] = fopen(filename, "rb");
 		if (!e->fdd[i])
 			return -1;
+
 		fseek(e->fdd[i], 0, SEEK_END);
 		int size = ftell(e->fdd[i]);
 		for (int j = 0; fmt[j].sectors; j++) {
@@ -531,7 +548,9 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 				return 0;
 			}
 		}
-		return -1;
+		/* Fallback to standard 1.44MB geometry if size does not match table exactly */
+		e->fdfmti[i] = 0;
+		return 0;
 	}
 	return 0;
 }
@@ -550,36 +569,35 @@ static void exec_cmd(EMULINK *e)
 		e->cmd = -1;
 		break;
 	case 0x100:
-		e->status = 0;
-		if (e->fdd[0])
-			e->status |= 0x40;
-		if (e->fdd[1])
-			e->status |= 0x04;
+		/* Report Drive 0 as 1.44MB 3.5" (0x40) always; Drive 1 if attached */
+		e->status = 0x40 | (e->fdd[1] ? 0x04 : 0);
 		e->cmd = -1;
 		break;
 	case 0x101:
 	case 0x102:
 		if (e->argi == 3) {
 			int ret;
-			if (!e->fdd[e->args[0]]) {
+			if (e->args[0] >= 2 || !e->fdd[e->args[0]]) {
 				e->status = -EIO;
 				e->cmd = -1;
 				break;
 			}
-			if (e->args[0] < 2) {
-				int c = e->args[1] >> 16;
-				int h = (e->args[1] >> 8) & 0xff;
-				int s = e->args[1] & 0xff;
-				const struct fdfmt *f = &(fmt[e->fdfmti[e->args[0]]]);
-				int lba = (c * f->heads + h) * f->sectors + (s - 1);
-				ret = fseek(e->fdd[e->args[0]], 512 * lba, SEEK_SET);
-				if (ret < 0) {
-					e->status = -errno;
-					e->cmd = -1;
-				} else {
-					e->status = 0;
-					e->dataleft = 512 * e->args[2];
-				}
+			int drive = e->args[0];
+			e->changed[drive] = 0;
+			int c = e->args[1] >> 16;
+			int h = (e->args[1] >> 8) & 0xff;
+			int s = e->args[1] & 0xff;
+			if (s < 1)
+				s = 1;
+			const struct fdfmt *f = &(fmt[e->fdfmti[drive]]);
+			int lba = (c * f->heads + h) * f->sectors + (s - 1);
+			ret = fseek(e->fdd[drive], 512 * lba, SEEK_SET);
+			if (ret < 0) {
+				e->status = -errno;
+				e->cmd = -1;
+			} else {
+				e->status = 0;
+				e->dataleft = 512 * e->args[2];
 			}
 		}
 		break;
@@ -621,6 +639,7 @@ int emulink_data_write_string(void *s, uint8_t *buf, int size, int count)
 				break;
 			e->dataleft -= len;
 			if (e->dataleft == 0) {
+				fflush(e->fdd[e->args[0]]);
 				e->cmd = -1;
 				e->status = 0;
 				return count;
@@ -661,4 +680,24 @@ int emulink_data_read_string(void *s, uint8_t *buf, int size, int count)
 	e->cmd = -1;
 	e->status = -1;
 	return count;
+}
+
+int emulink_floppy_is_inserted(EMULINK *e, int drive)
+{
+	if (!e || drive < 0 || drive >= 2)
+		return 0;
+	return e->fdd[drive] != NULL;
+}
+
+int emulink_floppy_changed(EMULINK *e, int drive)
+{
+	if (!e || drive < 0 || drive >= 2)
+		return 1;
+	return e->changed[drive];
+}
+
+void emulink_floppy_clear_changed(EMULINK *e, int drive)
+{
+	if (e && drive >= 0 && drive < 2)
+		e->changed[drive] = 0;
 }

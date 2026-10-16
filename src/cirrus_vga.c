@@ -236,7 +236,7 @@ static int cirrus_bitblt_solidfill(CirrusVGAState *s, int blt_rop)
         }
     }
 
-    /* 2. Try amd64 OpenCL GPU/CPU accelerator */
+    /* 2. Try host OpenCL GPU/CPU accelerator */
     if (cirrus_opencl_available()) {
         if (cirrus_opencl_solid_fill(s, s->cirrus_blt_dstaddr, s->cirrus_blt_dstpitch,
                                      s->cirrus_blt_width, s->cirrus_blt_height,
@@ -312,7 +312,7 @@ static int cirrus_bitblt_videotovideo_copy(CirrusVGAState *s)
         }
     }
 
-    /* 2. Try amd64 OpenCL GPU/CPU acceleration */
+    /* 2. Try host OpenCL GPU/CPU acceleration */
     if (cirrus_opencl_available()) {
         if (cirrus_opencl_copy(s, s->cirrus_blt_dstaddr, s->cirrus_blt_srcaddr,
                                s->cirrus_blt_dstpitch, s->cirrus_blt_srcpitch,
@@ -1423,7 +1423,7 @@ CirrusVGAState *cirrus_vga_init(VGAState *vga, PCIBus *bus, void *pc_opaque, PCI
     /* BAR 1: 4KB Memory-Mapped I/O (MMIO) */
     pci_register_bar(s->pci_dev, 1, CIRRUS_PNPMMIO_SIZE, PCI_ADDRESS_SPACE_MEM, pc_opaque, bar_set);
 
-    /* Initialize OpenCL (amd64) and PPA (ESP32-P4) 2D engines */
+    /* Initialize OpenCL (host) and PPA (ESP32-P4) 2D engines */
     cirrus_opencl_init();
     cirrus_ppa_init();
 

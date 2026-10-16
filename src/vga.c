@@ -667,6 +667,13 @@ static void vga_text_refresh(VGAState *s,
     
     width1 = width * cwidth;
     height1 = height * cheight;
+    /* A 9-dot font makes 80 columns 720px wide, which does not fit a 640px
+       framebuffer.  Fall back to the 8-dot font so the whole text screen
+       (e.g. the SeaBIOS boot messages) remains visible. */
+    if (cwidth == 9 && (fb_dev->width < width1 || fb_dev->height < height1)) {
+        cwidth = 8;
+        width1 = width * cwidth;
+    }
 #if defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY)
 #if defined(SCALE_3_2)
     if (fb_dev->width * 3 / 2 < width1 || fb_dev->height * 3 / 2 < height1 ||

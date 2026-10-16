@@ -7,18 +7,13 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
-#if defined(USE_AMD64)
-static void raise_irq_amd64(void *o, PicState2 *s)
-{
-	cpuamd64_raise_irq(o);
-}
-#else
+
 static void raise_irq_i386(void *o, PicState2 *s)
 {
 	cpui386_raise_irq(o);
 }
-#endif
 
 #if defined(USE_CPUABS)
 static void raise_irq_kvm(void *o, PicState2 *s)
@@ -51,16 +46,6 @@ static CPUABS *cpu_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 		cpu->enable_fpu = NULL;
 		cpu->_raise_irq = raise_irq_kvm;
 	} else {
-#if defined(USE_AMD64)
-		cpu->cpu = cpuamd64_new(gen, phys_mem, phys_mem_size, cb);
-		cpu->reset = (void *) cpuamd64_reset;
-		cpu->reset_pm = (void *) cpuamd64_reset_pm;
-		cpu->set_gpr = (void *) cpuamd64_set_gpr;
-		cpu->step = (void *) cpuamd64_step;
-		cpu->register_mem = NULL;
-		cpu->enable_fpu = NULL;
-		cpu->_raise_irq = raise_irq_amd64;
-#else
 		cpu->cpu = cpui386_new(gen, phys_mem, phys_mem_size, cb);
 		cpu->reset = (void *) cpui386_reset;
 		cpu->reset_pm = (void *) cpui386_reset_pm;
@@ -69,7 +54,6 @@ static CPUABS *cpu_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 		cpu->register_mem = NULL;
 		cpu->enable_fpu = (void *) cpui386_enable_fpu;
 		cpu->_raise_irq = raise_irq_i386;
-#endif
 	}
 	return cpu;
 }
@@ -109,8 +93,8 @@ static void cpu_enable_fpu(CPUABS *cpu)
 
 #define raise_irq(o) ((o)->_raise_irq)
 #define raise_irq_param(o) ((o)->cpu)
+#define cpu_protect_rom(...) do {} while (0) //noop
 #else
-#if !defined(USE_AMD64)
 #define cpu_reset cpui386_reset
 #define cpu_reset_pm cpui386_reset_pm
 #define cpu_set_gpr cpui386_set_gpr
@@ -120,20 +104,9 @@ static void cpu_enable_fpu(CPUABS *cpu)
 #define cpu_register_mem(...) do {} while (0) //noop
 #define cpu_enable_fpu cpui386_enable_fpu
 #define cpu_new cpui386_new
+#define cpu_protect_rom cpui386_protect_rom
 #define raise_irq(...) raise_irq_i386
 #define raise_irq_param(o) (o)
-#else
-#define cpu_reset cpuamd64_reset
-#define cpu_reset_pm cpuamd64_reset_pm
-#define cpu_set_gpr cpuamd64_set_gpr
-#define cpu_step cpuamd64_step
-#define cpu_get_cycle cpuamd64_get_cycle
-#define cpu_register_mem(...) do {} while (0) //noop
-#define cpu_enable_fpu(...) do {} while (0) //noop
-#define cpu_new cpuamd64_new
-#define raise_irq(...) raise_irq_amd64
-#define raise_irq_param(o) (o)
-#endif
 #endif
 
 #ifdef BUILD_ESP32
@@ -148,11 +121,30 @@ void pcmalloc_init(void *ptr, long len);
 #define pcmalloc_init(ptr, len)
 #endif
 
+/* Disk traffic is the one thing a healthy-but-idle guest still does while it
+   spins on a port (or waits for an interrupt); treat it as activity so a slow
+   read during boot is not mistaken for a shutdown. */
+static bool io_is_disk(int addr)
+{
+	switch (addr) {
+	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
+	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+	case 0x170: case 0x171: case 0x172: case 0x173:
+	case 0x174: case 0x175: case 0x176: case 0x177:
+	case 0x376: case 0x377: case 0x3f6: case 0x3f7:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static u8 pc_io_read(void *o, int addr)
 {
 	PC *pc = o;
 	u8 val;
 
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x20: case 0x21: case 0xa0: case 0xa1:
 		val = i8259_ioport_read(pc->pic, addr);
@@ -195,6 +187,18 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x376:
 		val = ide_status_read(pc->ide2);
 		return val;
+	case 0x3f4:
+		/* FDC Main Status Register (MSR). Return 0x00 (not ready / no FIFO),
+		   which tells Windows 95 not to attach protected-mode hsflop.pdr
+		   and keep using BIOS INT 13h / rmm.pdr via emulink. */
+		return 0x00;
+	case 0x3f7:
+		/* FDC Digital Input Register (DIR). Bit 7 is DSKCHG (Diskette Change).
+		   1 = media changed or drive empty, 0 = disk present and ready. */
+		if (!emulink_floppy_is_inserted(pc->emulink, 0) ||
+		    emulink_floppy_changed(pc->emulink, 0))
+			return 0x80;
+		return 0x00;
 	case 0x3b4: case 0x3b5: case 0x3ba:
 	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
 	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
@@ -291,6 +295,8 @@ static u16 pc_io_read16(void *o, int addr)
 	PC *pc = o;
 	u16 val;
 
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x1ce: case 0x1cf:
 		val = vbe_read(pc->vga, addr - 0x1ce);
@@ -321,6 +327,8 @@ static u32 pc_io_read32(void *o, int addr)
 {
 	PC *pc = o;
 	u32 val;
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x1f0:
 		val = ide_data_readl(pc->ide);
@@ -361,6 +369,8 @@ static int pc_io_read_string(void *o, int addr, uint8_t *buf, int size, int coun
 static void pc_io_write(void *o, int addr, u8 val)
 {
 	PC *pc = o;
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x80: case 0xed:
 		/* used by linux, for io delay */
@@ -398,6 +408,15 @@ static void pc_io_write(void *o, int addr, u8 val)
 		return;
 	case 0x376:
 		ide_cmd_write(pc->ide2, val);
+		return;
+	case 0x3f2:
+		/* FDC Digital Output Register (DOR).
+		   Writing to DOR resets the disk change condition if a media is present. */
+		if (emulink_floppy_is_inserted(pc->emulink, 0))
+			emulink_floppy_clear_changed(pc->emulink, 0);
+		return;
+	case 0x3f7:
+		/* FDC Configuration Control Register (CCR) / Data Rate Select Register */
 		return;
 	case 0x3b4: case 0x3b5: case 0x3ba:
 	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
@@ -438,6 +457,17 @@ static void pc_io_write(void *o, int addr, u8 val)
 		adlib_write(pc->adlib, addr, val);
 		return;
 	case 0x8900:
+		/* SeaBIOS' APM hooks write the bare ASCII message to this port.
+		   "Shutdown" is recognised incrementally below; "Standby" and
+		   "Suspend" share its 'S' prefix, so they are detected on the
+		   second byte, which is enough to tell the three apart. */
+		if (pc->apm_prev == 'S') {
+			if (val == 't')
+				pc->apm_suspend = 1;	/* "Standby" */
+			else if (val == 'u')
+				pc->apm_suspend = 2;	/* "Suspend" */
+		}
+		pc->apm_prev = val;
 		switch (val) {
 		case 'S': if (pc->shutdown_state == 0) pc->shutdown_state = 1; break;
 		case 'h': if (pc->shutdown_state == 1) pc->shutdown_state = 2; break;
@@ -516,6 +546,8 @@ static void pc_io_write(void *o, int addr, u8 val)
 static void pc_io_write16(void *o, int addr, u16 val)
 {
 	PC *pc = o;
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x1f0:
 		ide_data_writew(pc->ide, val);
@@ -545,6 +577,8 @@ static void pc_io_write16(void *o, int addr, u16 val)
 static void pc_io_write32(void *o, int addr, u32 val)
 {
 	PC *pc = o;
+	if (io_is_disk(addr))
+		pc->disk_io_us = get_uticks();
 	switch(addr) {
 	case 0x1f0:
 		ide_data_writel(pc->ide, val);
@@ -587,18 +621,36 @@ static int pc_io_write_string(void *o, int addr, uint8_t *buf, int size, int cou
 
 static uint64_t s_vga_frames = 0;
 
-void pc_vga_step(void *o)
+/* Advance the VGA timing state and report whether a frame boundary was reached.
+ * On ESP32-P4 this runs on Core 0 (the CPU-emulation core) so that the retrace
+ * timing/status registers (st01) have a single writer; the guest also polls
+ * them from Core 0.  The rendering itself is left to pc_vga_render(). */
+int pc_vga_tick(void *o)
 {
 	PC *pc = o;
 	int refresh = vga_step(pc->vga);
-	if (refresh) {
+	if (refresh)
 		s_vga_frames++;
+	return refresh;
+}
 
-		vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
-			    pc->full_update != 0);
-		if (pc->full_update == 2)
-			pc->full_update = 0;
-	}
+/* Software-rasterise the current VGA state into the emulator framebuffer.
+ * On ESP32-P4 this runs on Core 1 so the (relatively expensive) software raster
+ * does not steal cycles from the x86 interpreter/JIT on Core 0.  Reads of guest
+ * registers/VRAM may tear by at most one frame, which is accepted. */
+void pc_vga_render(void *o)
+{
+	PC *pc = o;
+	vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
+		    pc->full_update != 0);
+	if (pc->full_update == 2)
+		pc->full_update = 0;
+}
+
+void pc_vga_step(void *o)
+{
+	if (pc_vga_tick(o))
+		pc_vga_render(o);
 }
 
 #ifndef ENABLE_PERF_STATS
@@ -637,17 +689,17 @@ static inline void pc_perf_stat_tick(PC *pc)
 			double fps = (double)d_frames / seconds;
 
 			char cpu_st[128] = {0};
-#if !defined(USE_AMD64) && !defined(USE_CPUABS)
+#if !defined(USE_CPUABS)
 			cpu_get_state_str(pc->cpu, cpu_st, sizeof(cpu_st));
 #endif
 			uint32_t jit_execs = jit_get_block_exec_count();
 			uint32_t jit_comps = jit_get_compile_count();
 			if (jit_execs > 0 || jit_comps > 0) {
 				fprintf(stderr, "[PERF] Speed: %.2f MIPS (%.0f IPS) | VGA: %.1f FPS | JIT: %u exec, %u comp | %s\n",
-				        mips, ips, fps, (unsigned)jit_execs, (unsigned)jit_comps, cpu_st);
+					mips, ips, fps, (unsigned)jit_execs, (unsigned)jit_comps, cpu_st);
 			} else {
 				fprintf(stderr, "[PERF] Speed: %.2f MIPS (%.0f IPS) | VGA: %.1f FPS | %s\n",
-				        mips, ips, fps, cpu_st);
+					mips, ips, fps, cpu_st);
 			}
 
 			last_time = now;
@@ -676,6 +728,66 @@ void pc_step(PC *pc)
 	cpu_step(pc->cpu, PC_STEP_COUNT);
 #if ENABLE_PERF_STATS
 	pc_perf_stat_tick(pc);
+#endif
+}
+
+bool pc_guest_powered_off(PC *pc)
+{
+#if defined(USE_CPUABS)
+	return false;
+#else
+	uint32_t now, cs, ip;
+
+	now = get_uticks();
+
+	/* Windows 95 does not always complete an APM power-off: depending on how
+	   the shutdown races, it either asks the BIOS to switch the machine off
+	   (port 0x8900, seen by the front-end as shutdown_state == 8) or merely
+	   exits to real mode and parks forever on its "It's now safe to turn off
+	   your computer" screen.  Recognise that second case so the front-end can
+	   still exit the process.
+
+	   Only a guest that has already run protected-mode code for a while can
+	   be Windows: the early boot loader briefly enables paging and also spins
+	   in real mode, at the very same CS:IP the shutdown screen uses, so a
+	   stalled boot must not be mistaken for a power-off.  Arm the real-mode
+	   idle test only after a sustained protected-mode session. */
+	if (!cpui386_in_real_mode(pc->cpu)) {
+		if (!pc->pm_since_us)
+			pc->pm_since_us = now;
+		else if (!pc->pm_established &&
+			 (uint32_t)(now - pc->pm_since_us) >= 3000000)
+			pc->pm_established = 1;
+		pc->halt_since_us = 0; /* running protected code: not idle */
+		return false;
+	}
+
+	if (!pc->pm_established) {
+		pc->pm_since_us = 0; /* real mode: restart the protected-mode run */
+		return false;
+	}
+
+	/* In real mode after Windows has run: require a CS:IP that has stopped
+	   moving and no disk traffic for a few seconds before calling it a
+	   power-off.  A guest that is still working keeps executing fresh code
+	   and keeps poking the IDE controller. */
+	if ((uint32_t)(now - pc->halt_poll_us) >= 250000) {
+		pc->halt_poll_us = now;
+		cpui386_get_real_csip(pc->cpu, &cs, &ip);
+		if (cs != pc->halt_cs ||
+		    (ip > pc->halt_ip ? ip - pc->halt_ip
+				      : pc->halt_ip - ip) > 32) {
+			pc->halt_cs = cs;
+			pc->halt_ip = ip;
+			pc->halt_since_us = now;
+		} else if (!pc->halt_since_us) {
+			pc->halt_since_us = now;
+		}
+		if (pc->disk_io_us > pc->halt_since_us)
+			pc->halt_since_us = pc->disk_io_us;
+	}
+	return pc->halt_since_us &&
+	       (uint32_t)(now - pc->halt_since_us) >= 5000000;
 #endif
 }
 
@@ -864,20 +976,6 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 	vga_mem_write32(pc->vga, addr - 0xa0000, val);
 }
 
-#if defined(USE_AMD64)
-static u64 iomem_read64(void *iomem, uword addr)
-{
-	return iomem_read32(iomem, addr) |
-		((u64) iomem_read32(iomem, addr + 4) << 32);
-}
-
-static void iomem_write64(void *iomem, uword addr, u64 val)
-{
-	iomem_write32(iomem, addr, val & 0xffffffff);
-	iomem_write32(iomem, addr + 4, val >> 32);
-}
-#endif
-
 static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 {
 	PC *pc = iomem;
@@ -948,6 +1046,44 @@ static void pc_set_boot_order(void *cmos, uint8_t (*set)(void *cmos, int addr, u
 	set(cmos, 0x38, (dev[2] << 4) | 0x01);
 }
 
+/* The primary slave hosts the emulated optical drive.  The kind of the mounted
+   path tells the two OSD entries apart: an ISO/floppy image is cdb, while a
+   host shared folder is cdc (cdc_size stays 0 because the disc is synthesised
+   on demand).  Win9x drives only this channel, so the two are mutually
+   exclusive and mounting one clears the other. */
+static void pc_on_cd_change(void *opaque, int drive, const char *filename)
+{
+	PC *pc = opaque;
+	if (!pc || drive != 1)
+		return;
+
+	struct stat st;
+	if (filename && filename[0] &&
+	    stat(filename, &st) == 0 && S_ISDIR(st.st_mode)) {
+		strncpy(pc->cdc_path, filename, sizeof(pc->cdc_path) - 1);
+		pc->cdc_path[sizeof(pc->cdc_path) - 1] = '\0';
+		pc->cdc_size = 0;
+		pc->cdb_path[0] = '\0';
+		pc->cdb_size = 0;
+		printf("[PC] Virtual CD-ROM (shared folder) mounted '%s'\n",
+		       pc->cdc_path);
+	} else if (filename && filename[0]) {
+		strncpy(pc->cdb_path, filename, sizeof(pc->cdb_path) - 1);
+		pc->cdb_path[sizeof(pc->cdb_path) - 1] = '\0';
+		pc->cdb_size = (stat(filename, &st) == 0) ? st.st_size : 0;
+		pc->cdc_path[0] = '\0';
+		pc->cdc_size = 0;
+		printf("[PC] CD-ROM state synchronized: mounted '%s' (%lld bytes)\n",
+		       pc->cdb_path, (long long)pc->cdb_size);
+	} else {
+		pc->cdb_path[0] = '\0';
+		pc->cdb_size = 0;
+		pc->cdc_path[0] = '\0';
+		pc->cdc_size = 0;
+		printf("[PC] Optical drive state synchronized: ejected (empty)\n");
+	}
+}
+
 PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	   u8 *fb, PCConfig *conf)
 {
@@ -959,16 +1095,14 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->cpu = cpu_new(conf->cpu_gen, mem, conf->mem_size, &cb);
 	if (conf->fpu)
 		cpu_enable_fpu(pc->cpu);
-#if defined(USE_AMD64)
-	if (conf->cpuid_vendor) {
-#if defined(USE_CPUABS)
-		if (conf->cpu_gen >= 0)
-			cpuamd64_set_vendor(pc->cpu->cpu, conf->cpuid_vendor);
-#else
-		cpuamd64_set_vendor(pc->cpu, conf->cpuid_vendor);
-#endif
-	}
-#endif
+	jit_init();
+	pc->pm_established = 0;
+	pc->pm_since_us = 0;
+	pc->disk_io_us = 0;
+	pc->halt_poll_us = 0;
+	pc->halt_since_us = 0;
+	pc->halt_cs = 0;
+	pc->halt_ip = 0;
 	pc->bios = conf->bios;
 	pc->vga_bios = conf->vga_bios;
 	pc->linuxstart = conf->linuxstart;
@@ -994,31 +1128,46 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->cmos = cmos_init(conf->mem_size, 8, pc->pic, set_irq);
 	pc->ide = ide_allocate(14, pc->pic, set_irq);
 	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
+	ide_set_cd_change_cb(pc->ide, pc_on_cd_change, pc);
 	const char **disks = conf->disks;
 	for (int i = 0; i < 4; i++) {
+		if (conf->iscd[i]) {
+			int ret;
+			/* Win9x only ever drives the primary IDE channel (0x1F0),
+			   so both optical drives share its slave slot: cdb (an
+			   ISO image) and cdc (a host shared folder) are mutually
+			   exclusive and whichever is configured last wins. */
+			if (i == 0)
+				ret = ide_attach_cd(pc->ide, 0, disks[i] ? disks[i] : "");
+			else
+				ret = ide_attach_cd(pc->ide, 1, disks[i] ? disks[i] : "");
+			/* A folder-backed virtual CD may legitimately fail to mount
+			   (empty/invalid shared folder): warn instead of aborting. */
+			if (ret != 0)
+				fprintf(stderr, "ide_attach_cd: drive %d failed to mount\n", i);
+			continue;
+		}
 		if (!disks[i] || disks[i][0] == 0)
 			continue;
 		int ret;
-		if (i < 2) {
-			if (conf->iscd[i])
-				ret = ide_attach_cd(pc->ide, i, disks[i]);
-			else
-				ret = ide_attach(pc->ide, i, disks[i]);
-			assert(ret == 0);
-		} else {
-			if (conf->iscd[i])
-				ret = ide_attach_cd(pc->ide2, i - 2, disks[i]);
-			else
-				ret = ide_attach(pc->ide2, i - 2, disks[i]);
-			assert(ret == 0);
-		}
+		if (i < 2)
+			ret = ide_attach(pc->ide, i, disks[i]);
+		else
+			ret = ide_attach(pc->ide2, i - 2, disks[i]);
+		assert(ret == 0);
 	}
 
+	/* The guest BIOS/Win9x enumerate IDE devices only at POST; a unit
+	   attached later never receives a drive letter.  The primary slave hosts
+	   the OSD's optical drive (cdb ISO image or cdc shared folder), so keep an
+	   empty-media ATAPI unit there from boot for runtime mounting. */
+	if (!ide_drive_present(pc->ide, 1))
+		ide_attach_cd(pc->ide, 1, "");
+
 	if (conf->fill_cmos) {
-		if (conf->fdd[0] || conf->fdd[1]) {
-			uint8_t fd_type = (conf->fdd[0] ? 0x40 : 0) | (conf->fdd[1] ? 0x04 : 0);
-			cmos_set(pc->cmos, 0x10, fd_type);
-		}
+		/* Drive A is always declared as 1.44MB (0x40) so BIOS/OS detects the drive even when empty; Drive B if configured */
+		uint8_t fd_type = 0x40 | (conf->fdd[1] ? 0x04 : 0);
+		cmos_set(pc->cmos, 0x10, fd_type);
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
 		pc_set_boot_order(pc->cmos, cmos_set, conf->boot);
 	}
@@ -1080,9 +1229,9 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	for (int i = 0; i < 2; i++) {
 		if (!fdd[i] || fdd[i][0] == 0)
 			continue;
-		int ret;
-		ret = emulink_attach_floppy(pc->emulink, i, fdd[i]);
-		assert(ret == 0);
+		if (emulink_attach_floppy(pc->emulink, i, fdd[i]) != 0)
+			fprintf(stderr, "warning: cannot attach floppy %d image '%s', ignoring\n",
+				i, fdd[i]);
 	}
 
 	cb->iomem = pc;
@@ -1093,10 +1242,6 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	cb->iomem_read32 = iomem_read32;
 	cb->iomem_write32 = iomem_write32;
 	cb->iomem_write_string = iomem_write_string;
-#if defined(USE_AMD64)
-	cb->iomem_read64 = iomem_read64;
-	cb->iomem_write64 = iomem_write64;
-#endif
 
 	pc->redraw = redraw;
 	pc->redraw_data = redraw_data;
@@ -1105,7 +1250,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 			       1, 12, pc->pic, set_irq,
 			       pc, pc_reset_request);
 	pc->adlib = adlib_new();
-	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
+	pc->ne2000 = isa_ne2000_init(0x300, conf->ne2000_irq ? conf->ne2000_irq : 9,
+				     pc->pic, set_irq);
 	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				0x00, 0x80, 0x480, 0);
 	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
@@ -1116,7 +1262,45 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0x2;
 	pc->shutdown_state = 0;
+	pc->apm_prev = 0;
+	pc->apm_suspend = 0;
 	pc->reset_request = 0;
+
+	pc->hda_path[0] = '\0';
+	pc->hda_size = 0;
+	pc->fda_path[0] = '\0';
+	pc->fda_size = 0;
+	pc->cdb_path[0] = '\0';
+	pc->cdb_size = 0;
+	pc->cdc_path[0] = '\0';
+	pc->cdc_size = 0;
+
+	if (conf->disks[0] && conf->disks[0][0]) {
+		strncpy(pc->hda_path, conf->disks[0], sizeof(pc->hda_path) - 1);
+		struct stat st;
+		if (stat(conf->disks[0], &st) == 0)
+			pc->hda_size = st.st_size;
+	}
+	if (conf->fdd[0] && conf->fdd[0][0]) {
+		strncpy(pc->fda_path, conf->fdd[0], sizeof(pc->fda_path) - 1);
+		struct stat st;
+		if (stat(conf->fdd[0], &st) == 0)
+			pc->fda_size = st.st_size;
+	}
+	/* The two optical drives share the primary slave slot (Win9x drives only
+	   the primary channel), so cdc takes precedence when both are configured
+	   in the ini: it is attached last and thus is the one actually mounted. */
+	if (conf->disks[2] && conf->disks[2][0] && conf->iscd[2]) {
+		strncpy(pc->cdc_path, conf->disks[2], sizeof(pc->cdc_path) - 1);
+		pc->cdc_path[sizeof(pc->cdc_path) - 1] = '\0';
+		pc->cdc_size = 0;
+	} else if (conf->disks[1] && conf->disks[1][0] && conf->iscd[1]) {
+		strncpy(pc->cdb_path, conf->disks[1], sizeof(pc->cdb_path) - 1);
+		struct stat st;
+		if (stat(conf->disks[1], &st) == 0)
+			pc->cdb_size = st.st_size;
+	}
+
 	return pc;
 }
 
@@ -1153,10 +1337,20 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 
 void load_bios_and_reset(PC *pc)
 {
+	/* A reset (including Windows 95's "Restart in MS-DOS mode") begins a new
+	   guest session, so the shutdown-idle detector starts over. */
+	pc->pm_established = 0;
+	pc->pm_since_us = 0;
+	pc->halt_poll_us = 0;
+	pc->halt_since_us = 0;
+	pc->halt_cs = 0;
+	pc->halt_ip = 0;
 	if (pc->bios && pc->bios[0])
 		load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
-	if (pc->vga_bios && pc->vga_bios[0])
-		load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
+	if (pc->vga_bios && pc->vga_bios[0]) {
+		int len = load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
+		cpu_protect_rom(0xc0000, 0xc0000 + len);
+	}
 	if (pc->kernel && pc->kernel[0]) {
 		int start_addr = 0x10000;
 		int cmdline_addr = 0xf800;
@@ -1255,6 +1449,8 @@ int parse_conf_ini(void* user, const char* section,
 			conf->enable_serial = atoi(value);
 		} else if (NAME("vga_force_8dm")) {
 			conf->vga_force_8dm = atoi(value);
+		} else if (NAME("ne2000_irq")) {
+			conf->ne2000_irq = atoi(value);
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {
@@ -1267,8 +1463,6 @@ int parse_conf_ini(void* user, const char* section,
 			conf->cpu_gen = atoi(value);
 		} else if (NAME("fpu")) {
 			conf->fpu = atoi(value);
-		} else if (NAME("cpuid_vendor")) {
-			conf->cpuid_vendor = strdup(value);
 		}
 	}
 #undef SEC

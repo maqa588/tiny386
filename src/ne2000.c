@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "ne2000.h"
@@ -282,8 +283,9 @@ void ne2000_receive(void *opaque, const uint8_t *buf, int size)
     if (size > MAX_ETH_FRAME_SIZE)
         return;
 
-    if (s->cmd & E8390_STOP || ne2000_buffer_full(s))
+    if (s->cmd & E8390_STOP || ne2000_buffer_full(s)) {
         return;
+    }
 
     /* XXX: check this */
     if (s->rxcr & 0x10) {
@@ -994,7 +996,7 @@ uint32_t ne2000_ioport_read(void *opaque, uint32_t addr)
         }
     }
 #ifdef DEBUG_NE2000
-    printf("NE2000: read addr=0x%x val=%02x\n", addr, ret);
+    printf("NE2000: read addr=0x%x val=0x%02x\n", addr, ret);
 #endif
     return ret;
 }
@@ -1208,7 +1210,11 @@ static inline int filter(uint8_t *buf, int size)
     return 0;
 }
 
-int wlanif_l2_input_hook(uint8_t *buf, int size)
+/* Feed an L2 frame received by the host NIC to the emulated card.  Both the
+ * WiFi and the Ethernet back ends land here: the ESP's own TCP/IP stack is
+ * bypassed, the guest owns the network interface.
+ * Returns non-zero when the frame should also be delivered to lwIP. */
+int ne2000_l2_input(uint8_t *buf, int size)
 {
     int r = filter(buf, size);
     if (r) {
@@ -1221,20 +1227,17 @@ int wlanif_l2_input_hook(uint8_t *buf, int size)
     return 0;
 }
 
-#ifdef USE_HOSTED_WIFI
-#include "esp_wifi_remote.h"
-#include "esp_wifi_remote_api.h"
-static void my_esp_get_mac(uint8_t *mac)
+/* Hooked into lwIP's wlanif_input() by src/esp/esp-idf.patch. */
+int wlanif_l2_input_hook(uint8_t *buf, int size)
 {
-    esp_wifi_remote_get_mac(WIFI_IF_STA, mac);
+    return ne2000_l2_input(buf, size);
 }
-#else
+
 #include "esp_mac.h"
 static void my_esp_get_mac(uint8_t *mac)
 {
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
 }
-#endif
 
 #endif
 

@@ -321,12 +321,8 @@ static void flush_coalesced_mmio_buffer(CPUKVM *cpu)
 					cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 					break;
 				case 8:
-#ifdef USE_AMD64
-					cpu->cb.iomem_write64(cpu->cb.iomem, addr, *(u64 *) data);
-#else
 					cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 					cpu->cb.iomem_write32(cpu->cb.iomem, addr + 4, *((u32 *) data + 1));
-#endif
 					break;
 				default:
 					abort();
@@ -441,12 +437,8 @@ void cpukvm_step(CPUKVM *cpu, int stepcount)
 				cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 				break;
 			case 8:
-#ifdef USE_AMD64
-				cpu->cb.iomem_write64(cpu->cb.iomem, addr, *(u64 *) data);
-#else
 				cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 				cpu->cb.iomem_write32(cpu->cb.iomem, addr + 4, *((u32 *) data + 1));
-#endif
 				break;
 			default:
 				abort();
@@ -463,12 +455,8 @@ void cpukvm_step(CPUKVM *cpu, int stepcount)
 				*(u32 *) data = cpu->cb.iomem_read32(cpu->cb.iomem, addr);
 				break;
 			case 8:
-#ifdef USE_AMD64
-				*(u64 *) data = cpu->cb.iomem_read64(cpu->cb.iomem, addr);
-#else
 				*(u32 *) data = cpu->cb.iomem_read32(cpu->cb.iomem, addr);
 				*((u32 *) data + 1) = cpu->cb.iomem_read32(cpu->cb.iomem, addr + 4);
-#endif
 				break;
 			default:
 				abort();

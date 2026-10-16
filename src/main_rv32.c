@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include "pc.h"
-#include "jit.h"
+#include "jit_rv32_esp.h"
 
 #define FIFO_VGA "/tmp/tiny386_vga"
 #define FIFO_KBD "/tmp/tiny386_kbd"

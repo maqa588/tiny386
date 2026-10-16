@@ -46,40 +46,49 @@ void _exit(int status) {
     asm volatile ("ecall" : : "r"(a0), "r"(a7) : "memory");
     while (1);
 }
+#else
+#include <stdio.h>
+static void raw_write_str(const char *s) { fputs(s, stdout); }
+static void raw_write_hex(uint32_t val) { printf("0x%08x", val); }
+static void raw_write_dec(uint32_t val) { printf("%u", val); }
 #endif
 
 /* Include JIT subsystem */
+#include "../src/i386_struct.h"
 #include "../src/jit.h"
 
-/* Simplified CPUI386 context matching memory layout of i386.h */
-typedef struct CPUI386 {
-    union {
-        uint32_t r32;
-        uint16_t r16;
-        uint8_t  r8[2];
-    } gprx[8];
-    uint32_t ip;
-    uint32_t next_ip;
-    uint32_t flags;
-    uint32_t flags_mask;
-    int cpl;
-    bool code16;
-    uint32_t sp_mask;
-    bool halt;
-    void *fpu;
-    uint8_t guest_code[1024];
-} CPUI386;
-
 static CPUI386 test_cpu;
+static uint8_t s_guest_code[1024];
 
-bool cpu_load8(CPUI386 *cpu, int seg, uint32_t addr, uint8_t *res) {
+bool cpu_load8(CPUI386 *cpu, int seg, uword addr, uint8_t *res) {
+    (void)cpu;
     (void)seg;
-    if (addr < sizeof(cpu->guest_code)) {
-        *res = cpu->guest_code[addr];
+    if (addr < sizeof(s_guest_code)) {
+        *res = s_guest_code[addr];
         return true;
     }
     return false;
 }
+
+bool cpu_load32(CPUI386 *cpu, int seg, uword addr, uint32_t *res) {
+    (void)cpu; (void)seg; (void)addr; (void)res;
+    return false;
+}
+
+bool cpu_store32(CPUI386 *cpu, int seg, uword addr, uint32_t val) {
+    (void)cpu; (void)seg; (void)addr; (void)val;
+    return false;
+}
+
+/* Real CPU has this in i386.c; the test CPU runs with paging disabled
+ * (cr0 == 0), so the non-paged branch (va >> 12) is faithfully mirrored. */
+uint32_t cpu_jit_va_page(CPUI386 *cpu, uint32_t va) {
+    (void)cpu;
+    return va >> 12;
+}
+
+/* Real CPU defines this in i386.c; the standalone harness needs its own. */
+long jit_cycle_deadline = 0;
 
 int main(void) {
     raw_write_str("============================================================\n");
@@ -119,7 +128,8 @@ int main(void) {
         0x90                          /* 0x18: nop          */
     };
 
-    memcpy(test_cpu.guest_code, code, sizeof(code));
+    memset(&test_cpu, 0, sizeof(test_cpu));
+    memcpy(s_guest_code, code, sizeof(code));
     test_cpu.ip = 0;
     test_cpu.next_ip = 0;
     test_cpu.code16 = false;
@@ -142,14 +152,14 @@ int main(void) {
         steps++;
         uint32_t pc = test_cpu.ip;
 
-        void *entry = jit_lookup(pc);
+        void *entry = jit_lookup(&test_cpu, pc);
         if (entry) {
             jit_executions++;
             ((jit_block_fn)entry)(&test_cpu);
             continue;
         }
 
-        if (jit_should_compile(pc)) {
+        if (jit_should_compile(&test_cpu, pc)) {
             raw_write_str("[2] Hotspot detected at EIP 0x");
             raw_write_hex(pc);
             raw_write_str("! Compiling Basic Block...\n");
@@ -165,18 +175,18 @@ int main(void) {
         }
 
         /* Fallback: manually interpret the setup instructions */
-        uint8_t op = test_cpu.guest_code[test_cpu.ip];
+        uint8_t op = s_guest_code[test_cpu.ip];
         if (op >= 0xB8 && op <= 0xBF) {
             int reg = op - 0xB8;
-            uint32_t imm = *(uint32_t *)&test_cpu.guest_code[test_cpu.ip + 1];
+            uint32_t imm = *(uint32_t *)&s_guest_code[test_cpu.ip + 1];
             test_cpu.gprx[reg].r32 = imm;
             test_cpu.ip += 5;
             test_cpu.next_ip = test_cpu.ip;
-        } else if (op == 0x01 && test_cpu.guest_code[test_cpu.ip + 1] == 0xC8) {
+        } else if (op == 0x01 && s_guest_code[test_cpu.ip + 1] == 0xC8) {
             test_cpu.gprx[0].r32 += test_cpu.gprx[1].r32;
             test_cpu.ip += 2;
             test_cpu.next_ip = test_cpu.ip;
-        } else if (op == 0x29 && test_cpu.guest_code[test_cpu.ip + 1] == 0xD1) {
+        } else if (op == 0x29 && s_guest_code[test_cpu.ip + 1] == 0xD1) {
             test_cpu.gprx[1].r32 -= test_cpu.gprx[2].r32;
             test_cpu.ip += 2;
             test_cpu.next_ip = test_cpu.ip;
@@ -210,7 +220,7 @@ int main(void) {
 
     if (test_cpu.gprx[0].r32 == 5050 && test_cpu.gprx[1].r32 == 0 && test_cpu.ip == 0x18 && compiles > 0) {
         raw_write_str("============================================================\n");
-        raw_write_str("  >>> SUCCESS: RV32 JIT Loop & Fallback Verified! <<<\n");
+        raw_write_str("  >>> SUCCESS: JIT Loop & Fallback Verified! <<<\n");
         raw_write_str("============================================================\n");
         return 0;
     } else {

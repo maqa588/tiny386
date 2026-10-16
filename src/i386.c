@@ -1,5 +1,6 @@
 #include "i386.h"
 #include "jit.h"
+#include "i386_struct.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -9,6 +10,8 @@
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #define noinline __attribute__((noinline))
 #else
 #define IRAM_ATTR
@@ -29,105 +32,14 @@
 #define fpu_exec1(...) false
 #define fpu_exec2(...) false
 #define fpu_delete(...)
+#ifndef FPU_DEFINED
+#define FPU_DEFINED
 typedef void FPU;
 #endif
-
-struct CPUI386 {
-#ifdef I386_OPT1
-	union {
-		u32 r32;
-		u16 r16;
-		u8 r8[2];
-	} gprx[8];
-#else
-	uword gpr[8];
 #endif
-	uword ip, next_ip;
-	uword flags;
-	uword flags_mask;
-	int cpl;
-	bool code16;
-	uword sp_mask;
-	bool halt;
 
-	FPU *fpu;
 
-	struct {
-		uword sel;
-		uword base;
-		uword limit;
-		uword flags;
-	} seg[8];
 
-	struct {
-		uword base;
-		uword limit;
-	} idt, gdt;
-
-	uword cr0, cr2, cr3;
-
-	uword dr[8];
-
-	struct {
-		unsigned long laddr;
-		uword xaddr;
-		uword paddr;
-	} ifetch;
-
-	struct {
-		int op;
-		uword dst;
-		uword dst2;
-		uword src1;
-		uword src2;
-		uword mask;
-	} cc;
-
-	struct {
-		int size;
-		struct tlb_entry {
-			uword lpgno;
-			uword xaddr;
-			int (*pte_lookup)[2];
-			u8 *ppte;
-		} *tab;
-	} tlb;
-
-	u8 *phys_mem;
-	long phys_mem_size;
-
-	long cycle;
-
-	int excno;
-	uword excerr;
-
-	bool intr;
-	CPU_CB cb;
-
-	int gen;
-	struct {
-		uword cs, eip, esp;
-	} sysenter;
-
-#ifdef AMD64_ENABLE_LEG32
-	struct {
-		u32 efer;
-	} lm;
-#define INIT_LM_EFER(cpu) ((cpu)->lm.efer = 0)
-#define GET_LM_EFER(cpu) ((cpu)->lm.efer)
-#define SET_LM_EFER(cpu, x) ((cpu)->lm.efer = (x))
-#define CPUID_LM0_2 0x2048
-#define CPUID_LM80_0 0x80000004
-#define CPUID_LM81_2 ((1<<29) | (1<<11))
-#else
-#define INIT_LM_EFER(cpu)
-#define GET_LM_EFER(cpu) 0
-#define SET_LM_EFER(cpu, x) THROW(EX_GP, 0)
-#define CPUID_LM0_2 0
-#define CPUID_LM80_0 0
-#define CPUID_LM81_2 0
-#endif
-};
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
 #undef likely
@@ -236,8 +148,37 @@ static inline u8 pload8(CPUI386 *cpu, uword addr)
 	return cpu->phys_mem[addr];
 }
 
+#if defined(TINY386_HAS_JIT)
+/* Absolute cycle budget for the current JIT dispatch session (see jit.h). */
+long jit_cycle_deadline = 0;
+
+/* SMC guard: a write into a page that holds compiled JIT code invalidates the
+ * blocks that started in that page. Invalidation is O(1): bump that page's
+ * generation so any hash entry recorded with the old generation is rejected at
+ * the next lookup; other pages' blocks stay valid. Only an 8-bit wrap-around of
+ * the generation falls back to a full reset (jit_smc_dirty). */
+static inline void jit_note_store(uword paddr)
+{
+	if (jit_smc_page_map) {
+		uint32_t pg = (uint32_t)(paddr >> 12);
+		if (pg < JIT_SMC_MAP_PAGES && jit_smc_page_map[pg]) {
+			if (++jit_page_gen[pg] == 0) {
+				/* Wrapping back to 0 can alias a stale recorded generation,
+				 * so retire every link at once through the epoch guard in
+				 * addition to the deferred full flush. */
+				jit_smc_dirty = 1;
+				jit_note_map_change();
+			}
+		}
+	}
+}
+#else
+static inline void jit_note_store(uword paddr) { (void)paddr; }
+#endif
+
 static inline void pstore8(CPUI386 *cpu, uword addr, u8 val)
 {
+	jit_note_store(addr);
 	cpu->phys_mem[addr] = val;
 }
 
@@ -257,11 +198,13 @@ static inline u32 pload32(CPUI386 *cpu, uword addr)
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
+	jit_note_store(addr);
 	__builtin_memcpy(&(cpu->phys_mem[addr]), &val, sizeof(val));
 }
 
 static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
+	jit_note_store(addr);
 	__builtin_memcpy(&(cpu->phys_mem[addr]), &val, sizeof(val));
 }
 
@@ -494,6 +437,8 @@ static void tlb_clear(CPUI386 *cpu)
 	}
 	cpu->ifetch.laddr = -1;
 	cpu->ifetch.paddr = 0;
+	jit_fast_tlb_flush();
+	jit_note_map_change();
 }
 
 static DRAM_ATTR int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm > 1]
@@ -598,6 +543,21 @@ static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword 
 //			pload8(cpu, ent->ppte) | (1 << 6)); // dirty
 	}
 	return true;
+}
+
+/* JIT helper: physical page number backing virtual address va.
+ * Non-faulting: returns 0xFFFFFFFF when the mapping cannot be determined. */
+uint32_t cpu_jit_va_page(CPUI386 *cpu, uint32_t va)
+{
+	if (!(cpu->cr0 & CR0_PG))
+		return va >> 12;
+	uword lpgno = (uword)(va >> 12);
+	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+	if (ent->lpgno != lpgno) {
+		if (!tlb_refill(cpu, ent, lpgno))
+			return 0xFFFFFFFFu;
+	}
+	return (uint32_t)((ent->xaddr ^ (uword)va) >> 12);
 }
 
 static bool IRAM_ATTR translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword laddr, int size, int cpl)
@@ -714,6 +674,116 @@ static inline bool in_iomem(uword addr)
 	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
 
+/*
+ * Option ROM window (e.g. the VGA BIOS loaded at 0xC0000).  Real hardware
+ * exposes it as read-only memory, but here the ROM is loaded into ordinary
+ * RAM, so a guest write silently corrupts the image that INT 10h later
+ * executes.  Windows 95 does exactly that: its display driver maps a shadow
+ * of the VGA BIOS and overwrites it, which used to make the emulator fault
+ * (#UD in the corrupted ROM) on shutdown.  Ignore such writes, except when
+ * the ROM's own code writes to itself (it patches its PCI/VBE data during
+ * POST).
+ */
+static uword rom_lo, rom_hi;
+
+void cpui386_protect_rom(uword lo, uword hi)
+{
+	rom_lo = lo;
+	rom_hi = hi;
+}
+
+static inline bool rom_write_protected(CPUI386 *cpu, uword addr)
+{
+	return addr >= rom_lo && addr < rom_hi &&
+	       cpu->seg[SEG_CS].base != rom_lo;
+}
+
+#if defined(TINY386_HAS_JIT)
+/* Inline flat-TLB (see jit.h). The storage is owned by the JIT backend, which
+ * allocates it on-chip and points jit_fast_tlb at it; it is filled here, on the
+ * C slow path, so that a fill always reflects a mapping the slow path just
+ * proved valid. */
+JitFastTLBEntry *jit_fast_tlb = NULL;
+bool jit_fast_tlb_active = false;
+
+/* Privilege level the resident entries were resolved for. Page permissions are
+ * a function of cpl>0 (see pte_lookup), so a cpl change must retire them. */
+static int s_fast_tlb_cpl = -1;
+
+void jit_fast_tlb_flush(void)
+{
+	if (jit_fast_tlb) {
+		__builtin_memset(jit_fast_tlb, 0xFF,
+		                 sizeof(JitFastTLBEntry) * JIT_FAST_TLB_SIZE);
+	}
+	s_fast_tlb_cpl = -1;
+}
+
+/* Retire the table when the privilege level moved since it was filled. Called
+ * from both the fill path (so the table is always homogeneous even when the
+ * interpreter fills it at several cpls) and the JIT dispatcher entry. */
+static inline void jit_fast_tlb_ensure_cpl(int cpl)
+{
+	if (s_fast_tlb_cpl >= 0 && s_fast_tlb_cpl != cpl)
+		jit_fast_tlb_flush();   /* leaves the table invalid and cpl unset */
+	s_fast_tlb_cpl = cpl;
+}
+
+/* Cache the flat 4KB mapping backing a just-translated access. Only
+ * page-granular facts are recorded, so the entry is valid for every
+ * 4-byte-aligned offset inside the page; anything that could make a hit differ
+ * from the slow path (segment base, null selector, RAM edge, MMIO, privilege
+ * level) simply leaves the page on the C path.
+ *
+ * The entry stores a VA->PA delta only: it does not model the PTE R/W bit, the
+ * dirty bit, or any per-access side effect. It is therefore consumed by the
+ * LOAD fast path only; the store fast path was removed because a page filled
+ * while readable-but-not-writable would otherwise accept a raw physical write,
+ * bypassing the #PF that VMM32 needs for copy-on-write. A fill triggered by a
+ * store is harmless and simply warms the page for the next load. */
+static inline void jit_fast_tlb_fill(CPUI386 *cpu, int seg, uword vaddr, uword paddr)
+{
+	if (unlikely(!jit_fast_tlb_active))
+		return;
+	/* Retire first: a cpl change must invalidate the resident tags before the
+	 * early-return below can trust one, otherwise a page filled with supervisor
+	 * rights could be reused while running at user level. */
+	jit_fast_tlb_ensure_cpl(cpu->cpl);
+	uword vpage = vaddr >> 12;
+	JitFastTLBEntry *e = &jit_fast_tlb[vpage & JIT_FAST_TLB_MASK];
+	if (likely(e->vpage_tag == (uint32_t)vpage))
+		return;   /* already resident; tags only go stale on a flush */
+	if (cpu->seg[seg].base != 0)
+		return;   /* probe requires linear == offset (flat segment) */
+	if (cpu->seg[seg].limit == 0 && (cpu->seg[seg].sel & ~3u) == 0)
+		return;   /* null selector must keep faulting on the slow path */
+	uword ppage = paddr & ~0xfffu;
+	if (ppage + 0x1000 > (uword)cpu->phys_mem_size)
+		return;   /* whole page must be RAM-backed */
+	if (in_iomem(ppage))
+		return;   /* MMIO has side effects the probe cannot reproduce */
+	if (rom_lo < rom_hi && ppage >= rom_lo && ppage < rom_hi)
+		return;   /* ROM stores are dropped / CS-dependent on the slow path */
+	uword pg = ppage >> 12;
+	if (jit_smc_page_map && pg < JIT_SMC_MAP_PAGES && jit_smc_page_map[pg])
+		return;   /* code page: stores must bump its SMC generation */
+	e->host_delta = (uintptr_t)((uintptr_t)&cpu->phys_mem[ppage] -
+	                            ((uintptr_t)vpage << 12));
+	e->vpage_tag = (uint32_t)vpage;
+}
+#else
+static inline void jit_fast_tlb_fill(CPUI386 *cpu, int seg, uword vaddr, uword paddr)
+{
+	(void)cpu; (void)seg; (void)vaddr; (void)paddr;
+}
+#endif
+
+void cpui386_get_real_csip(CPUI386 *cpu, uword *cs, uword *ip)
+{
+	*cs = cpu->seg[SEG_CS].sel;
+	*ip = cpu->ip;
+}
+
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
 	uword addr = res->addr1;
@@ -765,6 +835,8 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
 	uword addr = res->addr1;
+	if (rom_write_protected(cpu, addr))
+		return;
 	if (in_iomem(addr) && cpu->cb.iomem_write8) {
 		cpu->cb.iomem_write8(cpu->cb.iomem, addr, val);
 		return;
@@ -777,6 +849,8 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
+	if (rom_write_protected(cpu, res->addr1))
+		return;
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write16) {
 		cpu->cb.iomem_write16(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -794,6 +868,8 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
+	if (rom_write_protected(cpu, res->addr1))
+		return;
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write32) {
 		cpu->cb.iomem_write32(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -828,6 +904,7 @@ bool cpu_load ## BIT(CPUI386 *cpu, int seg, uword addr, u ## BIT *res) \
 { \
 	OptAddr o; \
 	TRY(translate ## BIT(cpu, &o, 1, seg, addr)); \
+	jit_fast_tlb_fill(cpu, seg, addr, o.addr1); \
 	*res = load ## BIT(cpu, &o); \
 	return true; \
 } \
@@ -836,6 +913,7 @@ bool cpu_store ## BIT(CPUI386 *cpu, int seg, uword addr, u ## BIT val) \
 { \
 	OptAddr o; \
 	TRY(translate ## BIT(cpu, &o, 2, seg, addr)); \
+	jit_fast_tlb_fill(cpu, seg, addr, o.addr1); \
 	store ## BIT(cpu, &o, val); \
 	return true; \
 } \
@@ -1034,7 +1112,7 @@ static bool IRAM_ATTR modsib(CPUI386 *cpu, int adsz16, int mod, int rm, uword *a
 	else return modsib32(cpu, mod, rm, addr, seg);
 }
 
-static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
+static bool read_desc_raw(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 {
 	OptAddr meml;
 	sel = sel & 0xffff;
@@ -1050,8 +1128,7 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 	}
 
 	if (off + 7 > limit) {
-		dolog("read_desc: sel %04x base %x limit %x off %x at ip=%08x sp=%08x\n", sel, base, limit, off, cpu->ip, REGi(4));
-		THROW(EX_GP, sel & ~0x3);
+		return false;
 	}
 	if (w1) {
 		TRY(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
@@ -1060,6 +1137,20 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 	TRY(translate_laddr(cpu, &meml, 1, base + off + 4, 4, 0));
 	*w2 = load32(cpu, &meml);
 	return true;
+}
+
+static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
+{
+	sel = sel & 0xffff;
+	uword off = sel & ~0x7;
+	uword base = (sel & 0x4) ? cpu->seg[SEG_LDT].base : cpu->gdt.base;
+	uword limit = (sel & 0x4) ? cpu->seg[SEG_LDT].limit : cpu->gdt.limit;
+
+	if (off + 7 > limit) {
+		dolog("read_desc: sel %04x base %x limit %x off %x at ip=%08x sp=%08x\n", sel, base, limit, off, cpu->ip, REGi(4));
+		THROW(EX_GP, sel & ~0x3);
+	}
+	return read_desc_raw(cpu, sel, w1, w2);
 }
 
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
@@ -2245,8 +2336,10 @@ noinline void IRAM_ATTR try_jcc8(CPUI386 *cpu)
 	int rm = modrm & 7; \
 	if (reg == 0) { \
 		u32 new_cr0 = lreg32(rm); \
-		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) \
+		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
+			jit_flush(); \
+		} \
 		if (cpu->fpu) new_cr0 |= 0x10; \
 		if ((new_cr0 & CR0_PG) && !(cpu->cr0 & CR0_PG)) { \
 			fprintf(stderr, "[CR0 PG ENABLED] cr0=%08x cr3=%08x ip=%08x cs=%04x cpl=%d\n", new_cr0, (unsigned)cpu->cr3, (unsigned)cpu->ip, (unsigned)cpu->seg[SEG_CS].sel, cpu->cpl); \
@@ -3545,7 +3638,9 @@ static bool larsl_helper(CPUI386 *cpu, int sel, uword *ar, uword *sl, int *zf)
 	}
 
 	uword w1, w2;
-	if (!read_desc(cpu, sel, &w1, &w2)) {
+	if (!read_desc_raw(cpu, sel, &w1, &w2)) {
+		cpu->excno = 0;
+		cpu->excerr = 0;
 		*zf = 0;
 		return true;
 	}
@@ -3601,7 +3696,9 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	}
 
 	uword w1, w2;
-	if (!read_desc(cpu, sel, &w1, &w2)) {
+	if (!read_desc_raw(cpu, sel, &w1, &w2)) {
+		cpu->excno = 0;
+		cpu->excerr = 0;
 		*zf = 0;
 		return true;
 	}
@@ -3724,7 +3821,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDw(...) XADD_helper(16, __VA_ARGS__)
 #define XADDd(...) XADD_helper(32, __VA_ARGS__)
 
-#define INVLPG(addr) tlb_clear(cpu);
+#define INVLPG(addr) tlb_clear(cpu); jit_flush();
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
@@ -3946,23 +4043,51 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	uword sp_mask = cpu->sp_mask;
 
 	cpu->ip = cpu->next_ip;
-#if defined(__riscv)
-	if (unlikely(!code16 && (cpu->cr0 & 1) && sp_mask == 0xffffffff)) {
+#if defined(TINY386_HAS_JIT)
+	if (unlikely(!code16 && (cpu->cr0 & 1) && sp_mask == 0xffffffff &&
+	             cpu->seg[SEG_CS].base == 0 && cpu->seg[SEG_SS].base == 0)) {
+		/* The flat-TLB entries bake in the current privilege level; a ring
+		 * change (which only happens outside a compiled block) retires them. */
+		jit_fast_tlb_ensure_cpl(cpu->cpl);
 		uint32_t guest_pc = cpu->ip;
 		uint32_t blk_insns = 1;
-		void *entry = jit_lookup_ex(guest_pc, &blk_insns);
-		if (!entry && jit_should_compile(guest_pc)) {
+		void *entry = jit_lookup_ex(cpu, guest_pc, &blk_insns);
+		if (!entry && jit_should_compile(cpu, guest_pc)) {
 			entry = jit_compile_block(cpu, guest_pc);
-			if (entry) blk_insns = jit_get_block_insn_count(guest_pc);
+			if (entry) blk_insns = jit_get_block_insn_count(cpu, guest_pc);
 		}
 		if (entry) {
 			if (unlikely(cpu->cc.mask != 0)) {
 				refresh_flags(cpu);
 				cpu->cc.mask = 0;
 			}
-			((jit_block_fn)entry)(cpu);
-			cpu->cycle += blk_insns;
-			cpu->next_ip = cpu->ip;
+			/* Compiled blocks account for their own retired instructions
+			 * (cpu->cycle += N) so a chained run can span many blocks in one
+			 * entry. The absolute deadline bounds that run to this session's
+			 * step budget. Backends that do not self-account leave cpu->cycle
+			 * untouched, detected as a zero delta and handled the old way. */
+			long cyc0 = cpu->cycle;
+			jit_cycle_deadline = cpu->cycle + stepcount;
+			do {
+				((jit_block_fn)entry)(cpu);
+				cpu->next_ip = cpu->ip;
+				int used = (int)(cpu->cycle - cyc0);
+				if (used == 0) {
+					used = (int)blk_insns;
+					cpu->cycle += blk_insns;
+				}
+				stepcount -= used;
+				cyc0 = cpu->cycle;
+				if (unlikely(cpu->excno != 0 || stepcount <= 0 || cpu->intr)) {
+					break;
+				}
+				guest_pc = cpu->ip;
+				entry = jit_lookup_ex(cpu, guest_pc, &blk_insns);
+				if (!entry && jit_should_compile(cpu, guest_pc)) {
+					entry = jit_compile_block(cpu, guest_pc);
+					if (entry) blk_insns = jit_get_block_insn_count(cpu, guest_pc);
+				}
+			} while (entry != NULL);
 			if (unlikely(cpu->excno != 0)) {
 				return false;
 			}
@@ -5129,7 +5254,11 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	}
 
 	if (cpu->halt) {
+#if defined(BUILD_ESP32)
+		vTaskDelay(pdMS_TO_TICKS(1));
+#else
 		usleep(1);
+#endif
 		return;
 	}
 
@@ -5147,7 +5276,6 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			pusherr = true;
 		}
 		cpu->next_ip = cpu->ip;
-
 		if (!call_isr(cpu, cpu->excno, pusherr, 1)) {
 			fprintf(stderr, "call_isr FAILED for excno=%d pusherr=%d at ip=%08x sp=%08x cr0=%08x cr3=%08x excerr=%08x\n",
 				cpu->excno, pusherr, cpu->ip, REGi(4), cpu->cr0, cpu->cr3, cpu->excerr);
@@ -5232,6 +5360,7 @@ void cpui386_reset(CPUI386 *cpu)
 
 	cpu->cc.mask = 0;
 	tlb_clear(cpu);
+	jit_flush();
 	cpu->excno = 0;
 	cpu->excerr = 0;
 
@@ -5282,6 +5411,11 @@ void cpui386_get_state_str(CPUI386 *cpu, char *buf, size_t sz)
 {
 	snprintf(buf, sz, "cs:ip=%04x:%08x cpl=%d cr0=%08x cr3=%08x esp=%08x",
 		(unsigned)cpu->seg[SEG_CS].sel, (unsigned)cpu->ip, cpu->cpl, (unsigned)cpu->cr0, (unsigned)cpu->cr3, (unsigned)REGi(4));
+}
+
+bool cpui386_in_real_mode(CPUI386 *cpu)
+{
+	return !(cpu->cr0 & 1);
 }
 
 void cpui386_set_idtr(CPUI386 *cpu, uint32_t base, uint16_t limit)

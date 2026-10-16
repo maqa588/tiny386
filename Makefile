@@ -10,19 +10,41 @@ OBJCOPY_win32 = i686-w64-mingw32-objcopy
 OBJCOPY = ${OBJCOPY_${PLAT}}
 HOSTCC = ${CC}
 
+# Host OS detection: macOS (Darwin) needs different linker flags and libraries
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+DARWIN = y
+endif
+ifeq ($(DARWIN),y)
+# Apple ld64 has no --gc-sections (use -dead_strip); libdl lives in libSystem;
+# OpenGL is a framework instead of -lGL.
+CFLAGS_GCSECTIONS = -Wl,-dead_strip
+LIBS_DL =
+LIBS_GL = -framework OpenGL
+else
+CFLAGS_GCSECTIONS = -Wl,--gc-sections
+LIBS_DL = -ldl
+LIBS_GL = -lGL
+endif
+
 # All emulator sources live under src/; object files go to build/obj (gitignored)
 INCDIR = src
 OBJDIR = build/obj
 
 SDL_CONFIG ?= $(shell which sdl2-config 2>/dev/null || which sdl-config 2>/dev/null || echo sdl-config)
-SLIRP_INC =
-SLIRP_LIB = -lslirp
+# libslirp: the upstream pkg-config module is named "slirp" (Debian/Hombrew),
+# while some distributions install it as "libslirp"; probe both.  pkg-config
+# reports -I<prefix>/include/slirp, but ne2000.c includes "slirp/libslirp.h",
+# so strip the trailing /slirp from the include path.
+SLIRP_PKG ?= $(shell pkg-config --exists libslirp 2>/dev/null && echo libslirp || (pkg-config --exists slirp 2>/dev/null && echo slirp))
+SLIRP_INC ?= $(shell pkg-config --cflags ${SLIRP_PKG} 2>/dev/null | sed -e 's|-I\([^ ]*\)/slirp|-I\1|g')
+SLIRP_LIB ?= $(shell pkg-config --libs ${SLIRP_PKG} 2>/dev/null)
 
 ifeq ($(ENABLE_ASAN),y)
 CFLAGS_ = -I ${INCDIR} -Wall -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS_ += -fsanitize=address,undefined
 else
-CFLAGS_ = -I ${INCDIR} -Wall -O3 -ffunction-sections -fdata-sections -g -Wl,--gc-sections
+CFLAGS_ = -I ${INCDIR} -Wall -O3 -ffunction-sections -fdata-sections -g ${CFLAGS_GCSECTIONS}
 endif
 CFLAGS_win32 = -I ${INCDIR} -Wall -O3 -ffunction-sections -g -Wl,--gc-sections
 CFLAGS = ${CFLAGS_${PLAT}}
@@ -38,7 +60,7 @@ LDFLAGS_ += -fsanitize=address,undefined
 endif
 LDFLAGS = ${LDFLAGS_${PLAT}}
 
-LIBS = -lm -ldl
+LIBS = -lm ${LIBS_DL}
 
 SRCS =
 
@@ -55,16 +77,9 @@ SRCS += ${SRCS_GLIBC_FIX}
 CFLAGS += ${CFLAGS_GLIBC_FIX}
 LIBS += ${LIBS_GLIBC_FIX}
 
-LIBS_SDL_ = `${SDL_CONFIG} --libs` -lGL ${LIBS}
+LIBS_SDL_ = `${SDL_CONFIG} --libs` ${LIBS_GL} ${LIBS}
 LIBS_SDL_win32 = `${SDL_CONFIG} --libs` ${LIBS}
 LIBS_SDL = ${LIBS_SDL_${PLAT}}
-
-LIBS_RAWDRAW_ = -ldl ${LIBS}
-LIBS_RAWDRAW_win32 = -lgdi32 -lwinmm ${LIBS}
-LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
-
-#USE_SDL = y/n
-USE_SDL = n
 
 #USE_FMOPL = y/n
 USE_FMOPL = y
@@ -79,7 +94,7 @@ CFLAGS_CPUABS_y = -DUSE_CPUABS
 CFLAGS += ${CFLAGS_CPUABS_${USE_CPUABS}}
 
 #USE_SLIRP = y/n
-USE_SLIRP ?= $(shell pkg-config --exists libslirp 2>/dev/null && echo y || echo n)
+USE_SLIRP ?= $(if $(strip ${SLIRP_PKG}),y,n)
 CFLAGS_SLIRP_y = -DUSE_SLIRP ${SLIRP_INC}
 LIBS_SLIRP_y_ = ${SLIRP_LIB}
 LIBS_SLIRP_y_win32 = ${SLIRP_LIB} -lws2_32 -liphlpapi
@@ -93,13 +108,6 @@ USE_TUNTAP = ${USE_TUNTAP_${PLAT}}
 CFLAGS_TUNTAP_y = -DUSE_TUNTAP
 CFLAGS += ${CFLAGS_TUNTAP_${USE_TUNTAP}}
 
-SUFF_SDL_SDL_y =
-SUFF_SDL_SDL_n = _sdl
-SUFF_RAWDRAW_SDL_y = _rawdraw
-SUFF_RAWDRAW_SDL_n =
-SUFF_SDL = ${SUFF_SDL_SDL_${USE_SDL}}
-SUFF_RAWDRAW = ${SUFF_RAWDRAW_SDL_${USE_SDL}}
-
 #ENABLE_CISO = n/zlib/miniz
 ENABLE_CISO = n
 CFLAGS_zlib = -DIDE_ENABLE_CISO -include zlib.h
@@ -111,28 +119,25 @@ CFLAGS += ${CFLAGS_${ENABLE_CISO}}
 LIBS += ${LIBS_${ENABLE_CISO}}
 SRCS += ${SRCS_${ENABLE_CISO}}
 
-#USE_AMD64 = n/y/full
-USE_AMD64 = n
-CFLAGS_AMD64_y = -DUSE_AMD64
-CFLAGS_AMD64_full = -DUSE_AMD64 -DAMD64_ENABLE_LEG32
-SRCS_AMD64_n = ${INCDIR}/i386.c ${INCDIR}/fpu.c
-SRCS_AMD64_y = ${INCDIR}/amd64.c ${INCDIR}/fpu.c
-SRCS_AMD64_full = ${OBJDIR}/amd64-comb.o ${OBJDIR}/i386-comb.o
-CFLAGS += ${CFLAGS_AMD64_${USE_AMD64}}
-SRCS += ${SRCS_AMD64_${USE_AMD64}}
+# The emulator core is the i386 cpu emulator plus the optional x87 fpu.
+SRCS += ${INCDIR}/i386.c ${INCDIR}/fpu.c
 
-#ENABLE_RAWDRAW_WAYLAND = n/y
-ENABLE_RAWDRAW_WAYLAND = n
-CFLAGS_RAWDRAW_WAYLAND_y = -DCNFG_WAYLAND
-CFLAGS += ${CFLAGS_RAWDRAW_WAYLAND_${ENABLE_RAWDRAW_WAYLAND}}
-PREPARE_WAYLAND_y = prepare_wayland
-PREPARE_WAYLAND = ${PREPARE_WAYLAND_${ENABLE_RAWDRAW_WAYLAND}}
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),arm64)
+SRCS += ${INCDIR}/jit_arm64.c
+else ifeq ($(UNAME_M),aarch64)
+SRCS += ${INCDIR}/jit_arm64.c
+endif
 
-PROGS_ = tiny386 tiny386_headless wifikbd initnet
-PROGS_win32 = tiny386 tiny386_headless wifikbd
+ifeq ($(DARWIN),y)
+PROGS_ = tiny386 tiny386_headless
+else
+PROGS_ = tiny386 tiny386_headless initnet
+endif
+PROGS_win32 = tiny386 tiny386_headless
 PROGS = ${PROGS_${PLAT}}
 
-SRCS += ${INCDIR}/ini.c ${INCDIR}/i8259.c ${INCDIR}/i8254.c ${INCDIR}/ide.c ${INCDIR}/vga.c ${INCDIR}/vgafont.c ${INCDIR}/cirrus_vga.c ${INCDIR}/cirrus_opencl.c ${INCDIR}/cirrus_ppa.c ${INCDIR}/i8042.c ${INCDIR}/misc.c ${INCDIR}/adlib.c ${INCDIR}/ne2000.c ${INCDIR}/i8257.c ${INCDIR}/sb16.c ${INCDIR}/pcspk.c
+SRCS += ${INCDIR}/ini.c ${INCDIR}/i8259.c ${INCDIR}/i8254.c ${INCDIR}/ide.c ${INCDIR}/isofs.c ${INCDIR}/vga.c ${INCDIR}/vgafont.c ${INCDIR}/cirrus_vga.c ${INCDIR}/cirrus_opencl.c ${INCDIR}/cirrus_ppa.c ${INCDIR}/i8042.c ${INCDIR}/misc.c ${INCDIR}/adlib.c ${INCDIR}/ne2000.c ${INCDIR}/i8257.c ${INCDIR}/sb16.c ${INCDIR}/pcspk.c
 SRCS += ${FMOPL_${USE_FMOPL}}
 SRCS += ${CPUABS_${USE_CPUABS}}
 SRCS += ${INCDIR}/pc.c
@@ -144,7 +149,7 @@ SRCS += ${INCDIR}/osd/microui.c ${INCDIR}/osd/osd.c
 
 OBJS = $(patsubst %.c,${OBJDIR}/%.o,${SRCS})
 
-.PHONY: all clean dep prepare prepare_wayland
+.PHONY: all clean dep prepare
 
 ${OBJDIR}/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -157,43 +162,16 @@ win32:
 	make -C . PLAT=win32
 
 clean:
-	rm -rf ${OBJDIR} .depends ${PROGS} i386.o amd64.o fpu.o amd64-comb.o i386-comb.o fpu-leg32.o i386-leg32.o
+	rm -rf ${OBJDIR} .depends ${PROGS}
 
-prepare: ${INCDIR}/fmopl.inc ${PREPARE_WAYLAND}
-
-prepare_wayland:
-	make -C ${INCDIR}/rawdraw/wayland
+prepare: ${INCDIR}/fmopl.inc
 
 ${INCDIR}/fmopl.inc: ${INCDIR}/fmopl.c
 	${HOSTCC} -DGENTABLE $^$> -o fmoplgen -lm && ./fmoplgen > $@ && rm -f ./fmoplgen
 
-${OBJDIR}/fpu-leg32.o: ${INCDIR}/fpu.c
-	@mkdir -p ${OBJDIR}
-	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${CC} ${CFLAGS} -UUSE_AMD64 -c $< -o $@
-
-${OBJDIR}/i386-leg32.o: ${INCDIR}/i386.c
-	@mkdir -p ${OBJDIR}
-	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${CC} ${CFLAGS} -UUSE_AMD64 -c $< -o $@
-
-${OBJDIR}/i386-comb.o: ${OBJDIR}/i386-leg32.o ${OBJDIR}/fpu-leg32.o
-	@/bin/echo -e " \e[1;32mLD\e[0m\t\e[1;37m$^$>\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${LD} -r -o $@ $^$>
-	${Q}${OBJCOPY} --localize-hidden --keep-global-symbols=${INCDIR}/i386_syms.txt $@
-
-${OBJDIR}/amd64-comb.o: ${OBJDIR}/${INCDIR}/amd64.o ${OBJDIR}/${INCDIR}/fpu.o
-	@/bin/echo -e " \e[1;32mLD\e[0m\t\e[1;37m$^$>\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${LD} -r -o $@ $^$>
-	${Q}${OBJCOPY} --localize-hidden --keep-global-symbols=${INCDIR}/amd64_syms.txt $@
-
-tiny386${SUFF_SDL}: ${INCDIR}/sdl/main.c ${OBJS}
+tiny386: ${INCDIR}/sdl/main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${LDFLAGS} ${CFLAGS_SDL} -o $@ $^$> ${LIBS_SDL}
-
-tiny386${SUFF_RAWDRAW}: ${INCDIR}/rawdraw/main.c ${OBJS}
-	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${CC} ${LDFLAGS} ${CFLAGS} -o $@ $^$> ${LIBS_RAWDRAW}
 
 fuzz_cpu: tests/fuzz_cpu.c ${OBJDIR}/${INCDIR}/i386.o ${OBJDIR}/${INCDIR}/fpu.o
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
@@ -202,10 +180,6 @@ fuzz_cpu: tests/fuzz_cpu.c ${OBJDIR}/${INCDIR}/i386.o ${OBJDIR}/${INCDIR}/fpu.o
 tiny386_headless: ${INCDIR}/main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${LDFLAGS} ${CFLAGS} -o $@ $^$> ${LIBS}
-
-wifikbd: ${INCDIR}/rawdraw/wifikbd.c ${INCDIR}/win32.c ${OBJDIR}/${INCDIR}/vgafont.o ${SRCS_GLIBC_FIX}
-	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${CC} ${LDFLAGS} ${CFLAGS} -o $@ $^$> ${LIBS_RAWDRAW}
 
 initnet: tools/initnet.c ${SRCS_GLIBC_FIX}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
@@ -216,6 +190,11 @@ initnet: tools/initnet.c ${SRCS_GLIBC_FIX}
 	${Q}mkdir -p $(dir $@)
 	${Q}rm -f $@
 	${Q}for i in $^$>; do ${CC} ${CFLAGS} -MT ${OBJDIR}/$${i%.c}.o -MM $$i 2> /dev/null >> $@ || exit 0; done
+	# Apple clang records the absolute path of the active Xcode SDK (SDKSettings.json)
+	# as a prerequisite.  That path is machine-specific, so if Xcode is later moved
+	# (e.g. to an external volume) the stale entry makes make abort with
+	# "No rule to make target ...SDKSettings.json".  Strip it from the dep file.
+	${Q}grep -v 'SDKSettings.json' $@ > $@.tmp; mv $@.tmp $@
 
 dep: .depends
 -include .depends

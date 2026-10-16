@@ -1,6 +1,7 @@
 # Editor / backup files
 *~
 *.swp
+.DS_Store
 
 # Build artifacts
 *.o
@@ -10,12 +11,13 @@
 fmopl.inc
 build/
 out/
+tiny386.dSYM/
+tiny386_headless.dSYM/
 
 # Built binaries
 tiny386
 tiny386_rv32
 tiny386_headless
-wifikbd
 initnet
 tools/sdl2_viewer
 tests/test_jit_flow
@@ -30,6 +32,8 @@ test_jit_rv32
 /firmware/*
 # SeaBIOS BIOS/VGA BIOS binaries are redistributed under LGPL-3.0 (see README)
 !/firmware/seabios/
+
+cpu-z_1.04-win9x/
 
 # ESP-IDF generated files
 src/esp/sdkconfig

@@ -1,7 +1,6 @@
 #ifndef I386_H
 #define I386_H
 
-#ifndef I386_IN_AMD64
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -16,11 +15,6 @@ typedef int8_t s8;
 
 typedef u32 uword;
 typedef s32 sword;
-#else
-#define CPU_CB CPUI386_CB
-#define uword u32
-#define sword s32
-#endif
 
 typedef struct CPUI386 CPUI386;
 
@@ -74,8 +68,12 @@ void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val);
 void cpui386_set_idtr(CPUI386 *cpu, uint32_t base, uint16_t limit);
 void cpui386_set_gdtr(CPUI386 *cpu, uint32_t base, uint16_t limit);
 long cpui386_get_cycle(CPUI386 *cpu);
+bool cpui386_in_real_mode(CPUI386 *cpu);
+void cpui386_protect_rom(uword lo, uword hi);
+/* Real-mode CS:IP the CPU is currently executing.  Used to spot a guest parked
+   on a fixed address, e.g. Windows 95's "safe to turn off" shutdown screen. */
+void cpui386_get_real_csip(CPUI386 *cpu, uword *cs, uword *ip);
 
-#ifndef I386_IN_AMD64
 bool cpu_load8(CPUI386 *cpu, int seg, uword addr, u8 *res);
 bool cpu_store8(CPUI386 *cpu, int seg, uword addr, u8 val);
 bool cpu_load16(CPUI386 *cpu, int seg, uword addr, u16 *res);
@@ -89,10 +87,5 @@ void cpu_setflags(CPUI386 *cpu, uword set_mask, uword clear_mask);
 uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
 void cpui386_get_state_str(CPUI386 *cpu, char *buf, size_t sz);
-#else
-#undef CPU_CB
-#undef uword
-#undef sword
-#endif
 
 #endif /* I386_H */

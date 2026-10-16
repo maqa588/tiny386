@@ -82,7 +82,7 @@ bool cirrus_ppa_solid_fill(CirrusVGAState *s,
 
     /* Map color format to PPA fill structure */
     uint8_t a = 0xFF, r = 0, g = 0, b = 0;
-    ppa_srm_color_mode_t cmode = PPA_SRM_COLOR_MODE_RGB565;
+    ppa_fill_color_mode_t cmode = PPA_FILL_COLOR_MODE_RGB565;
 
     if (pixelwidth == 2) {
         /* RGB565 / RGB555 */
@@ -90,13 +90,13 @@ bool cirrus_ppa_solid_fill(CirrusVGAState *s,
         r = ((c16 >> 11) & 0x1F) * 255 / 31;
         g = ((c16 >> 5) & 0x3F) * 255 / 63;
         b = (c16 & 0x1F) * 255 / 31;
-        cmode = PPA_SRM_COLOR_MODE_RGB565;
+        cmode = PPA_FILL_COLOR_MODE_RGB565;
     } else if (pixelwidth == 3 || pixelwidth == 4) {
         /* ARGB8888 */
         r = (fill_val >> 16) & 0xFF;
         g = (fill_val >> 8) & 0xFF;
         b = fill_val & 0xFF;
-        cmode = PPA_SRM_COLOR_MODE_ARGB8888;
+        cmode = PPA_FILL_COLOR_MODE_ARGB8888;
     } else {
         /* 8bpp color index: PPA fill doesn't support 8bpp directly, fallback to CPU */
         return false;
@@ -108,12 +108,12 @@ bool cirrus_ppa_solid_fill(CirrusVGAState *s,
             .buffer_size = span,
             .pic_w = dstpitch / (pixelwidth > 0 ? pixelwidth : 1),
             .pic_h = height,
-            .block_w = pixels_w,
-            .block_h = height,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_color_mode = cmode,
+            .fill_cm = cmode,
         },
+        .fill_block_w = pixels_w,
+        .fill_block_h = height,
         .fill_argb_color = {
             .val = (a << 24) | (r << 16) | (g << 8) | b,
         },
@@ -157,7 +157,7 @@ bool cirrus_ppa_blit(CirrusVGAState *s,
             .block_h = height,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_color_mode = PPA_SRM_COLOR_MODE_RGB565,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
         .out = {
             .buffer = s->vga->vga_ram + dstaddr,
@@ -166,7 +166,7 @@ bool cirrus_ppa_blit(CirrusVGAState *s,
             .pic_h = height,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_color_mode = PPA_SRM_COLOR_MODE_RGB565,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x = 1.0f,

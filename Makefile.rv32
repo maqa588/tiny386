@@ -4,7 +4,7 @@ CFLAGS = -march=rv32imafc_zifencei -mabi=ilp32f -static -O3 -Isrc \
   -DI386_ENABLE_FPU -DI386_ENABLE_MMX -DI386_ENABLE_SSE -DI386_ENABLE_SSE2 -DI386_ENABLE_SSE3 -DI386_ENABLE_SSSE3
 LDFLAGS = -static -lm
 
-SRCS = src/main_rv32.c src/rv32_syscalls.c src/i386.c src/jit.c src/fpu.c src/ini.c src/i8259.c src/i8254.c src/ide.c src/vga.c src/vgafont.c \
+SRCS = src/main_rv32.c src/rv32_syscalls.c src/i386.c src/jit_rv32_esp.c src/fpu.c src/ini.c src/i8259.c src/i8254.c src/ide.c src/isofs.c src/vga.c src/vgafont.c \
        src/cirrus_vga.c src/cirrus_opencl.c src/cirrus_ppa.c \
        src/i8042.c src/misc.c src/adlib.c src/ne2000.c src/i8257.c src/sb16.c src/pcspk.c src/fmopl.c src/pc.c src/pci.c src/win32.c
 

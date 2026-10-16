@@ -1,10 +1,6 @@
 // incomplete x87 emulation, use at your own risk!
 // no exception, no tag word, no float80
-#if defined(USE_AMD64)
-#include "amd64.h"
-#else
 #include "i386.h"
-#endif
 #include "fpu.h"
 #include <string.h>
 #include <stdlib.h>
@@ -154,11 +150,7 @@ struct FPU {
 
 #ifdef I386_ENABLE_SSE
 	u32 mxcsr;
-#ifndef USE_AMD64
 	UXMM xmm[8];
-#else
-	UXMM xmm[16];
-#endif
 #endif
 };
 

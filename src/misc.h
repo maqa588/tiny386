@@ -22,6 +22,9 @@ typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();
 
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename);
+int emulink_floppy_is_inserted(EMULINK *e, int drive);
+int emulink_floppy_changed(EMULINK *e, int drive);
+void emulink_floppy_clear_changed(EMULINK *e, int drive);
 uint32_t emulink_status_read(void *s);
 void emulink_cmd_write(void *s, uint32_t val);
 void emulink_data_write(void *s, uint32_t val);

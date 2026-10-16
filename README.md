@@ -3,7 +3,7 @@
 ## Introduction
 Tiny386 is an x86 PC emulator written in C99, optimized for **RISC-V 32-bit microcontrollers (MCUs)** such as the **ESP32-S31** and **ESP32-P4**. The goal is to run Windows 9x/NT on a single-chip RISC-V MCU.
 
-The same sources can also be built and run in interpreted mode on an **amd64** host. The amd64 build exists purely for development and testing — the final target is always the MCU.
+The same sources can also be built and run in interpreted mode on a **host** (x86_64 or arm64). The host build exists purely for development and testing — the final target is always the MCU.
 
 The core of the project is a built-from-scratch, simple and stupid i386 cpu emulator. Some features are missing, e.g. debugging, hardware tasking and some permission checks, but it should be able to run most 16/32 bit software. To boot modern linux kernel and windows, some 486 and 586 instrutions are added. The cpu emulator is kept in ~6K LOC. There is also an optional x87 fpu emulator.
 
@@ -22,12 +22,12 @@ To assemble a complete PC system, we have ported many peripherals from TinyEMU a
 
 For firmware, the BIOS/VGABIOS comes from SeaBIOS, so the emulator runs real x86 firmware. Tiny386 also supports booting linux kernel directly, without traditional BIOS. The idea comes from JSLinux, and it uses a small stub code called linuxstart.
 
-Tiny386 now supports i686, MMX, SSE (up to SSSE3) and amd64 (64bit long mode only). As these features are optional, they may be safely disregarded if not required.
+Tiny386 now supports i686, MMX, SSE (up to SSSE3). As these features are optional, they may be safely disregarded if not required.
 
 ## 2D acceleration
 The Cirrus CL-GD5446 blitter is emulated and accelerated:
  - **ESP32-P4**: the on-chip **PPA** 2D accelerator is used for plain forward blits.
- - **amd64 host**: an **OpenCL** backend accelerates blits (on a GPU or CPU device).
+ - **x86_64 host**: an **OpenCL** backend accelerates blits (on a GPU or CPU device).
  - A portable fallback CPU blitter implements all 16 ROP operations, transparent color compare and 8/16-bpp color expand, keeping rendering correct on every target.
 
 Windows 95 in 16-bit color (800x480) on the Cirrus CL-GD5446 — dragging and repainting windows now renders correctly with acceleration enabled:
@@ -40,27 +40,29 @@ See [here](https://hchunhui.github.io/tiny386)
 ## Build
 
 ### ESP32 (primary target)
-Both RISC-V 32 targets (ESP32-S31 / ESP32-P4) use **ESP-IDF 6.0.x**.
+Both RISC-V 32 targets (ESP32-S31 / ESP32-P4) use **ESP-IDF 6.1.x**.
 
 Supported boards:
-- `JC4880P443` (ESP32-P4 Rev1.3 360MHz, 800x480)
+- `wt0132p4_a1` (WT0132P4-A1 ESP32-P4 core module: RMII Ethernet, SD 4-bit,
+  640x480 RGB565 VGA via ADV7123, I2S audio via PCM5102A)
+- `s31_wroom3` (ESP32-S31 WROOM-3 module)
 
 To build and flash:
 ```sh
-scripts/build.sh patch_idf_60  # apply patches to ESP-IDF 6.0.x
+scripts/build.sh patch_idf  # apply patches to ESP-IDF 6.1.x
 cd src/esp
-idf.py -DBOARD=jc4880p443 update-dependencies build
+idf.py -DBOARD=wt0132p4_a1 update-dependencies build
 idf.py flash
 ```
 
 Online flasher for esp chips: https://espressif.github.io/esptool-js
 
-### amd64 host (development / testing only)
-The host build runs the same emulator in interpreted mode, which is useful to test changes quickly before flashing the MCU. Requires the SDL2 development library (`libsdl2-dev`), and `libslirp` for networking.
+### Host (Linux / macOS, development / testing only)
+The host build runs the same emulator in interpreted mode, which is useful to test changes quickly before flashing the MCU. Requires the SDL2 development library (`libsdl2-dev` on Debian/Ubuntu, `brew install sdl2` on macOS), and `libslirp` for networking.
 
 ```sh
-./run_amd64_tiny386.sh                 # native SDL2 frontend, Windows 95 by default
-./run_amd64_tiny386.sh tiny386_pc.ini  # boot DOS instead
+./run_emu_tiny386.sh                 # native SDL2 frontend, Windows 95 by default
+./run_emu_tiny386.sh conf/win98.ini  # boot another config
 ```
 
 The very same code can also be run as a RISC-V 32 target under `qemu-riscv32`:
@@ -73,7 +75,7 @@ For a minimal build without any optional features:
 gcc -O3 -Isrc src/*.c -o tiny386_headless -lm
 ```
 
-The legacy host frontends (rawdraw, plain SDL, win32, WASM) still live in the tree, but are not the project's focus.
+The host frontend is a single SDL2 target (`tiny386`), which builds on Linux, macOS and Windows. A headless target (`tiny386_headless`) and a WASM build are also available for testing.
 
 For details, please refer to `.github/workflows/build.yml` and `Makefile`.
 
@@ -115,22 +117,23 @@ vga_force_8dm = 0
 Press "Ctrl + ]" to grab/ungrab the keyboard and mouse. Press "Ctrl + [" to show/hide OSD (On Screen Display). In OSD mode, the floppy/CD-ROM disk can be changed on the fly.
 
 ## ESP32 port
-Supported boards (ESP-IDF 6.0.x):
-- `JC4880P443` (ESP32-P4 Rev1.3 360MHz, 800x480)
+Supported boards (ESP-IDF 6.1.x):
+- `wt0132p4_a1` (WT0132P4-A1 ESP32-P4 core module, 640x480 VGA)
+- `s31_wroom3` (ESP32-S31 WROOM-3 module)
 
-ESP32-S31 is the next RISC-V 32 target; together with the ESP32-P4 it shares the same emulator core and the ESP-IDF 6.0.x toolchain.
+ESP32-S31 is the next RISC-V 32 target; together with the ESP32-P4 it shares the same emulator core and the ESP-IDF 6.1.x toolchain.
 
 ### Build and Flash
-You can find the pre-built flash image `flash_image_JC4880P443.bin` from [here](https://github.com/hchunhui/tiny386/releases).
+You can find the pre-built flash image `flash_image_WT0132P4_A1.bin` from [here](https://github.com/hchunhui/tiny386/releases).
 The pre-built image can be flashed directly to offset 0.
 
 Online flasher for esp chips: https://espressif.github.io/esptool-js
 
 To build and flash manually:
 ```sh
-scripts/build.sh patch_idf_60  # apply patches to ESP-IDF 6.0.x
+scripts/build.sh patch_idf  # apply patches to ESP-IDF 6.1.x
 cd src/esp
-idf.py -DBOARD=jc4880p443 update-dependencies build
+idf.py -DBOARD=wt0132p4_a1 update-dependencies build
 idf.py flash
 ```
 
@@ -142,13 +145,6 @@ Alternative usage: `bios.bin` `vgabios.bin` `vmlinux.bin` and `linuxstart.bin` c
 
 ### Keyboard/Mouse Input
 
-- Forward over WIFI
-
-`wifikbd` is used to forward keyboard/mouse events to the dev board over WIFI:
-```
-(ESP32 board: listen on TCP port 9999) <--- WIFI ---> AP <--- WIFI/Wire ---> (PC: ./wifikbd esp_board_addr 9999)
-```
-
 - USB hid (experimental)
 
 Add the following config:
@@ -156,8 +152,6 @@ Add the following config:
 [esp]
 enable_usb = 1
 ```
-
-Note: DO NOT enable USB and WIFI at the same time on RAM-constrained boards.
 
 ## Troubleshooting
 

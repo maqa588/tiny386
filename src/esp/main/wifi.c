@@ -8,6 +8,13 @@
 */
 #include <string.h>
 #include <stdatomic.h>
+
+/* Published by whichever network back end is active (WiFi here, Ethernet in
+ * eth.c); qemu_send_packet_null() in ne2000.c reads it.  Declared outside the
+ * USE_WIFI guard so Ethernet-only boards (ESP32-P4) still link the symbol. */
+void (*_Atomic esp32_send_packet)(uint8_t *buf, int size);
+
+#ifdef USE_WIFI
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -47,8 +54,6 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static const char *TAG = "simple wifi";
 
-void (*_Atomic esp32_send_packet)(uint8_t *buf, int size);
-
 #ifndef ESP_IF_WIFI_STA
 #define ESP_IF_WIFI_STA WIFI_IF_STA
 #endif
@@ -80,21 +85,11 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 	}
 }
 
-#ifdef USE_HOSTED_WIFI
-#include "esp_hosted.h"
-#endif
-
 void wifi_init_sta(const char *ssid, const char *pass)
 {
 	s_wifi_event_group = xEventGroupCreate();
 
 	ESP_ERROR_CHECK(esp_netif_init());
-
-#ifdef USE_HOSTED_WIFI
-	ESP_LOGI(TAG, "init ESP-Hosted");
-	esp_hosted_init();
-	esp_hosted_connect_to_slave();
-#endif
 
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 	esp_netif_create_default_wifi_sta();
@@ -251,5 +246,8 @@ void wifi_main(const char *ssid, const char *pass)
 	}
 	ESP_ERROR_CHECK(ret);
 	wifi_init_sta(ssid, pass);
-	xTaskCreatePinnedToCore(server_thread, "wifi", 4096, NULL, 1, NULL, 0);
+	/* Peripheral tasks are kept off Core 0, which is dedicated to the x86
+	 * interpreter/JIT; display + peripherals share Core 1. */
+	xTaskCreatePinnedToCore(server_thread, "wifi", 4096, NULL, 1, NULL, 1);
 }
+#endif /* USE_WIFI */

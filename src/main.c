@@ -5,6 +5,7 @@
 #include <string.h>
 #include <errno.h>
 #include "pc.h"
+#include "jit.h"
 
 // platform HAL implementation
 #include <time.h>
@@ -167,12 +168,142 @@ int main(int argc, char *argv[])
 		term = term_init(pc->vga, put_key, pc->kbd);
 	load_bios_and_reset(pc);
 
+	/* Run the same binary in pure-interpreter mode for A/B measurements:
+	 * TINY386_NO_JIT=1 disables the JIT at runtime, so both sides of the
+	 * comparison share identical code generation and build flags. */
+	if (getenv("TINY386_NO_JIT"))
+		jit_enable(false);
+
 	pc->boot_start_time = get_uticks();
 	for (; g_running && pc->shutdown_state != 8;) {
 		pc_step(pc);
 		pc_vga_step(pc);
+		if (getenv("TINY386_AUTO_ENTER")) {
+			static int s_auto_stage = 0;
+			/* The GUI half of the script (mouse moves, clicks, Win+E) is opt-in:
+			 * plain TINY386_AUTO_ENTER only dismisses the logon prompt so that a
+			 * clean desktop (with any auto-started app window) can be inspected. */
+			bool auto_gui = getenv("TINY386_AUTO_GUI") != NULL;
+			uint32_t elapsed = get_uticks() - pc->boot_start_time;
+			int t_target = atoi(getenv("TINY386_AUTO_ENTER"));
+			int login_period = getenv("TINY386_AUTO_LOGIN_PERIOD") ?
+				atoi(getenv("TINY386_AUTO_LOGIN_PERIOD")) : 0;
+			if (login_period > 0) {
+				/* Robust logon handling: the Windows/network logon dialog
+				 * appears at a highly variable point in the boot, so instead
+				 * of one hard-coded moment, pulse Enter at a fixed interval
+				 * across a wide window to dismiss it whenever it shows up. */
+				static int s_pulse_on = 0;
+				static int s_pulse_count = 0;
+				static uint32_t s_pulse_next = 0;
+				if (elapsed >= (uint32_t)t_target * 1000000 &&
+				    elapsed < (uint32_t)(t_target + 90) * 1000000 &&
+				    s_pulse_count < 40) {
+					if (!s_pulse_on && elapsed >= s_pulse_next) {
+						s_pulse_on = 1;
+						s_pulse_next = elapsed + 100000;
+						fprintf(stderr, "[AUTO-INPUT] login Enter down #%d t=%us...\n",
+							s_pulse_count + 1, (unsigned)(elapsed / 1000000));
+						ps2_put_keycode(pc->kbd, 1, 0x1c);
+					} else if (s_pulse_on && elapsed >= s_pulse_next) {
+						s_pulse_on = 0;
+						s_pulse_count++;
+						s_pulse_next = elapsed + (uint32_t)login_period * 1000000;
+						ps2_put_keycode(pc->kbd, 0, 0x1c);
+					}
+				}
+			} else if (s_auto_stage == 0 && elapsed >= (uint32_t)t_target * 1000000) {
+				s_auto_stage = 1;
+				fprintf(stderr, "[AUTO-INPUT] Enter #1 (Login) make at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 1, 0x1c);
+			} else if (s_auto_stage == 1 && elapsed >= (uint32_t)t_target * 1000000 + 200000) {
+				s_auto_stage = 2;
+				fprintf(stderr, "[AUTO-INPUT] Enter #1 (Login) break at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 0, 0x1c);
+			} else if (s_auto_stage == 2 && elapsed >= (uint32_t)(t_target + 8) * 1000000) {
+				s_auto_stage = 3;
+				fprintf(stderr, "[AUTO-INPUT] Enter #2 (Dismiss) make at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 1, 0x1c);
+			} else if (s_auto_stage == 3 && elapsed >= (uint32_t)(t_target + 8) * 1000000 + 200000) {
+				s_auto_stage = 4;
+				fprintf(stderr, "[AUTO-INPUT] Enter #2 (Dismiss) break at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 0, 0x1c);
+			} else if (auto_gui && s_auto_stage >= 4 && s_auto_stage < 14 && elapsed >= (uint32_t)(t_target + 10) * 1000000 + (s_auto_stage - 4) * 100000) {
+				int step = s_auto_stage - 4;
+				s_auto_stage++;
+				fprintf(stderr, "[AUTO-INPUT] Mouse move step %d/10 at t=%us...\n", step + 1, (unsigned)(elapsed / 1000000));
+				ps2_mouse_event(pc->mouse, -27, -19, 0, 0);
+			} else if (auto_gui && s_auto_stage == 14 && elapsed >= (uint32_t)(t_target + 12) * 1000000) {
+				s_auto_stage = 15;
+				fprintf(stderr, "[AUTO-INPUT] Mouse Click #1 down at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_mouse_event(pc->mouse, 0, 0, 0, 1);
+			} else if (auto_gui && s_auto_stage == 15 && elapsed >= (uint32_t)(t_target + 12) * 1000000 + 100000) {
+				s_auto_stage = 16;
+				fprintf(stderr, "[AUTO-INPUT] Mouse Click #1 up at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_mouse_event(pc->mouse, 0, 0, 0, 0);
+			} else if (auto_gui && s_auto_stage == 16 && elapsed >= (uint32_t)(t_target + 12) * 1000000 + 200000) {
+				s_auto_stage = 17;
+				fprintf(stderr, "[AUTO-INPUT] Mouse Click #2 down at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_mouse_event(pc->mouse, 0, 0, 0, 1);
+			} else if (auto_gui && s_auto_stage == 17 && elapsed >= (uint32_t)(t_target + 12) * 1000000 + 300000) {
+				s_auto_stage = 18;
+				fprintf(stderr, "[AUTO-INPUT] Mouse Click #2 up at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_mouse_event(pc->mouse, 0, 0, 0, 0);
+			} else if (auto_gui && s_auto_stage == 18 && elapsed >= (uint32_t)(t_target + 15) * 1000000) {
+				s_auto_stage = 19;
+				fprintf(stderr, "[AUTO-INPUT] Win+E make at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 1, 0xe05b);
+				ps2_put_keycode(pc->kbd, 1, 0x12);
+			} else if (auto_gui && s_auto_stage == 19 && elapsed >= (uint32_t)(t_target + 15) * 1000000 + 200000) {
+				s_auto_stage = 20;
+				fprintf(stderr, "[AUTO-INPUT] Win+E break at t=%us...\n", (unsigned)(elapsed / 1000000));
+				ps2_put_keycode(pc->kbd, 0, 0x12);
+				ps2_put_keycode(pc->kbd, 0, 0xe05b);
+			}
+		}
+		if (getenv("TINY386_DUMP_BDA")) {
+			static uint32_t last_bda = 0;
+			uint32_t now = get_uticks();
+			if (now - last_bda >= 5000000) {
+				last_bda = now;
+				fprintf(stderr, "BDA @%us:\n",
+					(unsigned)((now - pc->boot_start_time) / 1000000));
+				for (int a = 0x400; a < 0x500; a += 16) {
+					fprintf(stderr, "  %04x:", a);
+					for (int i = 0; i < 16; i++)
+						fprintf(stderr, " %02x",
+							(unsigned char)pc->phys_mem[a + i]);
+					fprintf(stderr, "\n");
+				}
+				fprintf(stderr, "  IVT int11=%04x:%04x int15=%04x:%04x\n",
+					*(uint16_t *)(pc->phys_mem + 0x40),
+					*(uint16_t *)(pc->phys_mem + 0x42),
+					*(uint16_t *)(pc->phys_mem + 0x54),
+					*(uint16_t *)(pc->phys_mem + 0x56));
+			}
+		}
+		if (getenv("TINY386_DUMP_RAM")) { /* TEMP-RAMDUMP: debug only */
+			static uint32_t last_ram = 0;
+			uint32_t now = get_uticks();
+			if (now - last_ram >= 30000000) {
+				last_ram = now;
+				FILE *fp = fopen(getenv("TINY386_DUMP_RAM"), "wb");
+				if (fp) {
+					fwrite(pc->phys_mem, 1, conf.mem_size, fp);
+					fclose(fp);
+					fprintf(stderr, "RAM dumped at %us\n",
+						(unsigned)((now - pc->boot_start_time) / 1000000));
+				}
+			}
+		}
+		if (pc_guest_powered_off(pc)) {
+			fprintf(stderr, "[EXIT] powered_off t=%us\n",
+				(unsigned)((get_uticks() - pc->boot_start_time) / 1000000));
+			break;
+		}
 		if (use_term)
 			term_step(term);
 	}
+	fprintf(stderr, "[DONE] shutdown_state=%d\n", pc->shutdown_state);
 	return 0;
 }

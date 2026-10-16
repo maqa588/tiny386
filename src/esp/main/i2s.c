@@ -191,6 +191,8 @@ void i2s_main()
 		ESP_LOGW("I2S", "Audio codec init skipped: %s (continuing in silent mode)", esp_err_to_name(codec_ret));
 	}
 #endif
-	xTaskCreatePinnedToCore(i2s_task, "i2s_task", 4096, NULL, 0, NULL, 0);
+	/* Audio is a peripheral: keep it on Core 1 with the display pipeline so
+	 * Core 0 stays dedicated to the x86 interpreter/JIT. */
+	xTaskCreatePinnedToCore(i2s_task, "i2s_task", 4096, NULL, 0, NULL, 1);
 #endif
 }

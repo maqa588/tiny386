@@ -10,11 +10,26 @@
 #include <errno.h>
 #include <poll.h>
 
-#include <SDL2/SDL.h>
+#if defined(__has_include)
+# if __has_include(<SDL2/SDL.h>)
+#  include <SDL2/SDL.h>
+# elif __has_include(<SDL.h>)
+#  include <SDL.h>
+# else
+#  include <SDL2/SDL.h>
+# endif
+#else
+# include <SDL2/SDL.h>
+#endif
+
+#define GL_SILENCE_DEPRECATION 1
 #if defined(__has_include)
 # if __has_include(<GL/gl.h>)
 #  define USE_OPENGL 1
 #  include <GL/gl.h>
+# elif __has_include(<OpenGL/gl.h>)
+#  define USE_OPENGL 1
+#  include <OpenGL/gl.h>
 # endif
 #endif
 

@@ -43,7 +43,7 @@ build_thirdparty() {
 	build_seabios &&
 	build_slirp &&
     cd .. &&
-    make prepare ENABLE_RAWDRAW_WAYLAND=y
+    make prepare
 }
 
 build_tiny386() {
@@ -52,19 +52,18 @@ build_tiny386() {
 	make \
 	     USE_GLIBC_FIX=y \
 	     USE_CPUABS=y \
-	     ENABLE_RAWDRAW_WAYLAND=y \
 	     SLIRP_INC="-I$PWD/build/slirp/build" \
 	     SLIRP_LIB="-L$PWD/build/slirp/build -lslirp" clean all &&
-	strip -s tiny386 wifikbd initnet &&
-	cp tiny386 wifikbd initnet out &&
+	strip -s tiny386 initnet &&
+	cp tiny386 initnet out &&
 	mkdir -p out/win32 &&
 	make \
 	     SLIRP_INC="-I$PWD/build/slirp/build-mingw32 -DLIBSLIRP_STATIC" \
 	     SLIRP_LIB="-L$PWD/build/slirp/build-mingw32 -lslirp" clean win32 &&
-	strip -s tiny386.exe wifikbd.exe &&
-	cp tiny386.exe wifikbd.exe out/win32 &&
+	strip -s tiny386.exe &&
+	cp tiny386.exe out/win32 &&
 	make clean &&
-	rm tiny386.exe wifikbd.exe &&
+	rm tiny386.exe &&
 	cd src/wasm && make && cd ../.. &&
         mkdir -p out/wasm &&
         cp src/wasm/html/tiny386.wasm out/wasm &&
@@ -76,13 +75,6 @@ patch_idf() {
     PDIR="$PWD"
     cd "$IDF_PATH" &&
     patch -p1 < "$PDIR/src/esp/esp-idf.patch" &&
-    cd "$PDIR"
-}
-
-patch_idf_60() {
-    PDIR="$PWD"
-    cd "$IDF_PATH" &&
-    patch -p1 < "$PDIR/src/esp/esp-idf-6.0.patch" &&
     cd "$PDIR"
 }
 
@@ -99,9 +91,9 @@ build_esp() {
 
 build_esp_p4() {
     mkdir -p out/esp &&
-        cd src/esp && rm -rf build sdkconfig && idf.py -DBOARD=jc4880p443 update-dependencies build &&
+        cd src/esp && rm -rf build sdkconfig && idf.py -DBOARD=wt0132p4_a1 update-dependencies build &&
         cd build &&
-        esptool.py --chip esp32p4 merge_bin -o flash_image_JC4880P443.bin '@flash_args' &&
+        esptool.py --chip esp32p4 merge_bin -o flash_image_WT0132P4_A1.bin '@flash_args' &&
         cd .. &&
         cp build/flash_image*.bin ../../out/esp &&
         cp tiny386.ini ../../out/esp &&
@@ -128,8 +120,6 @@ elif [ "$1" == "tiny386" ]; then
     build_tiny386
 elif [ "$1" == "patch_idf" ]; then
     patch_idf
-elif [ "$1" == "patch_idf_60" ]; then
-    patch_idf_60
 elif [ "$1" == "esp" ]; then
     build_esp
 elif [ "$1" == "esp_p4" ]; then

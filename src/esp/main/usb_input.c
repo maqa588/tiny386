@@ -32,6 +32,15 @@ int hid_usage_to_linux_keycode(int hid);
 static const char *TAG = "example";
 void usb_task(void *arg);
 
+/* Route a keyboard event through the OSD first: while the panel is visible it
+ * owns the keyboard, and the panel's Ctrl+[ show/hide hotkey is handled here
+ * too.  Everything the OSD does not consume is forwarded to the guest. */
+static void esp_kbd_send(int is_down, int code)
+{
+	if (!esp_osd_key(code, is_down))
+		ps2_put_keycode(globals.kbd, is_down, code);
+}
+
 static const uint8_t modifier_to_hid_usage[8] = {
     0xE0, // bit 0 left_ctr
     0xE1, // bit 1 left_shift
@@ -159,7 +168,7 @@ static void hid_host_keyboard_report_callback(const uint8_t *const data, const i
 
             //int ps2code = hid_usage_to_ps2input(hid_code);
             int linuxCode = hid_usage_to_linux_keycode(hid_code);
-            ps2_put_keycode(globals.kbd, is_down, linuxCode);
+            esp_kbd_send(is_down, linuxCode);
 
             // ESP_LOGE("HID",
             //          "MOD EVENT: %s HID=%02X (%s)  PS2=0x%X  Linux=%d",
@@ -184,7 +193,7 @@ static void hid_host_keyboard_report_callback(const uint8_t *const data, const i
 
             //int ps2code = hid_usage_to_ps2input(prev_keys[i]);
             int linuxCode = hid_usage_to_linux_keycode(prev_keys[i]);
-            ps2_put_keycode(globals.kbd, false, linuxCode);
+            esp_kbd_send(false, linuxCode);
             // ESP_LOGE("HID",
             //          "RELEASE EVENT: HID=%02X (%s)  PS2=0x%X   Linux=%d",
             //          prev_keys[i],
@@ -202,7 +211,7 @@ static void hid_host_keyboard_report_callback(const uint8_t *const data, const i
 
             //int ps2code = hid_usage_to_ps2input(kb_report->key[i]);
             int linuxCode = hid_usage_to_linux_keycode(kb_report->key[i]);
-            ps2_put_keycode(globals.kbd, true, linuxCode);
+            esp_kbd_send(true, linuxCode);
             // ESP_LOGE("HID",
             //          "PRESS EVENT: HID=%02X (%s)  PS2=0x%X   Linux=%d",
             //          kb_report->key[i],
@@ -228,6 +237,10 @@ static void hid_host_mouse_report_callback(const uint8_t *const data, const int 
     uint8_t buttons_raw = data[0];
     int8_t dx = (int8_t)data[1];
     int8_t dy = (int8_t)data[2];
+    /* HID boot protocol report byte 4 is the wheel (usage 0x38); positive
+     * means rotation towards the user (scroll down), matching the IMPS/2
+     * z-axis sign convention, so it can be passed straight through. */
+    int8_t dz = (length >= 4) ? (int8_t)data[3] : 0;
 
     // kill corrupt packets
     if (dx > 50 || dx < -50 || dy > 50 || dy < -50)
@@ -248,7 +261,10 @@ static void hid_host_mouse_report_callback(const uint8_t *const data, const int 
                buttons_raw, dx, dy, buttons_raw);
         fflush(stdout);
     }
-    ps2_mouse_event(globals.mouse, dx, dy, 0, buttons);
+    /* While the OSD is visible the pointer drives the panel; otherwise it
+     * feeds the guest (the wheel remains guest-only). */
+    if (!esp_osd_mouse(dx, dy, buttons))
+        ps2_mouse_event(globals.mouse, dx, dy, dz, buttons);
 }
 
 /**
@@ -435,7 +451,7 @@ void usb_setup(void)
                                            "usb_events",
                                            2048,
                                            xTaskGetCurrentTaskHandle(),
-                                           2, NULL, 0);
+                                           2, NULL, 1);
     assert(task_created == pdTRUE);
 
     // Wait for notification from usb_lib_task to proceed
@@ -450,7 +466,7 @@ void usb_setup(void)
         .create_background_task = true,
         .task_priority = 5,
         .stack_size = 4096,
-        .core_id = 0,
+        .core_id = 1,
         .callback = hid_host_device_callback,
         .callback_arg = NULL};
 
@@ -461,7 +477,9 @@ void usb_setup(void)
 
     ESP_LOGI(TAG, "Waiting for HID Device to be connected");
 
-    xTaskCreatePinnedToCore(usb_task, "usb_task", 2048, NULL, 0, NULL, 0);
+    /* USB input is a peripheral: keep it off Core 0 (x86 emulation) so it
+     * runs on Core 1 together with the display pipeline. */
+    xTaskCreatePinnedToCore(usb_task, "usb_task", 2048, NULL, 0, NULL, 1);
 }
 void usb_task(void *arg)
 {

@@ -17,6 +17,11 @@
 # if __has_include(<GL/gl.h>)
 #  define USE_OPENGL 1
 #  include <GL/gl.h>
+# elif __has_include(<OpenGL/gl.h>)
+/* macOS ships the OpenGL headers inside a framework */
+#  define GL_SILENCE_DEPRECATION 1
+#  define USE_OPENGL 1
+#  include <OpenGL/gl.h>
 # endif
 #endif
 
@@ -79,6 +84,8 @@ typedef struct {
 	PC *pc;
 	OSD *osd;
 	bool osd_enabled;
+	bool grabbed;
+	float wheel_accum; /* fractional wheel remainder (SDL preciseY) */
 } Console;
 
 void console_send_kbd(void *opaque, int keypress, int keycode)
@@ -86,6 +93,28 @@ void console_send_kbd(void *opaque, int keypress, int keycode)
 	Console *s = opaque;
 	ps2_put_keycode(s->pc->kbd, keypress, keycode);
 }
+
+void console_power_off(void *opaque)
+{
+	Console *s = opaque;
+	fprintf(stderr, "[PM] Power off requested from Control Panel, exiting...\n");
+	if (s && s->pc)
+		s->pc->shutdown_state = 8;
+	exit(0);
+}
+
+void console_trigger_suspend(void *opaque)
+{
+	Console *s = opaque;
+	if (s && s->pc) {
+		fprintf(stderr, "[PM] Suspend requested from Control Panel...\n");
+		/* Dismiss OSD overlay so screen is clean */
+		s->osd_enabled = false;
+		s->pc->full_update = 2;
+		s->pc->apm_suspend = 2; /* trigger suspend */
+	}
+}
+
 
 #ifndef BPP
 #define BPP 32
@@ -494,6 +523,22 @@ static void sdl_handle_mouse_button_event(const SDL_Event *ev, PC *pc)
 	}
 }
 
+/* Grab/ungrab the keyboard and mouse. Relative mouse mode is required so the
+   guest receives proper movement deltas and the host pointer is exclusively
+   captured (SDL_SetWindowGrab alone does not confine the pointer on macOS). */
+static void sdl_set_grab(Console *s, bool grab)
+{
+#if SDL_MAJOR_VERSION >= 2
+	SDL_SetRelativeMouseMode(grab ? SDL_TRUE : SDL_FALSE);
+	SDL_ShowCursor(grab ? SDL_DISABLE : SDL_ENABLE);
+	SDL_SetWindowGrab(s->window, grab ? SDL_TRUE : SDL_FALSE);
+#else
+	SDL_ShowCursor(grab ? SDL_DISABLE : SDL_ENABLE);
+	SDL_WM_GrabInput(grab ? SDL_GRAB_ON : SDL_GRAB_OFF);
+#endif
+	s->grabbed = grab;
+}
+
 static void poll(void *opaque)
 {
 	Console *s = opaque;
@@ -512,15 +557,7 @@ static void poll(void *opaque)
 				break;
 			}
 			if (keycode == 0x1b && key_pressed[0x1d]) {
-				static int en;
-				en ^= 1;
-#if SDL_MAJOR_VERSION >= 2
-				SDL_ShowCursor(en ? SDL_DISABLE : SDL_ENABLE);
-				SDL_SetWindowGrab(s->window, en ? SDL_TRUE : SDL_FALSE);
-#else
-				SDL_ShowCursor(en ? SDL_DISABLE : SDL_ENABLE);
-				SDL_WM_GrabInput(en ? SDL_GRAB_ON : SDL_GRAB_OFF);
-#endif
+				sdl_set_grab(s, !s->grabbed);
 				break;
 			}
 			/* fall through */
@@ -550,16 +587,100 @@ static void poll(void *opaque)
 				sdl_handle_mouse_button_event(&ev, s->pc);
 			break;
 #if SDL_MAJOR_VERSION >= 2
-		case SDL_MOUSEWHEEL:
-			sdl_send_mouse_event(s->pc, 0, 0,
-			                     ev.wheel.y > 0 ? -1 : (ev.wheel.y < 0 ? 1 : 0),
-			                     SDL_GetMouseState(NULL, NULL), 0);
+		case SDL_MOUSEWHEEL: {
+			/* SDL >= 2.0.18: on macOS (trackpad/Magic Mouse) and other
+			   hi-res wheels the integer ev.wheel.y is truncated to 0 and
+			   the real delta only appears in ev.wheel.preciseY.  Accumulate
+			   the fractional amount and emit one PS/2 step per notch. */
+			float wy;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+			wy = ev.wheel.preciseY;
+			if (wy == 0.0f)
+				wy = (float)ev.wheel.y;
+#else
+			wy = (float)ev.wheel.y;
+#endif
+			if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+				wy = -wy;
+			s->wheel_accum += wy;
+			int dz = 0;
+			while (s->wheel_accum >= 1.0f) {
+				dz -= 1; /* wheel up -> negative IMPS/2 z */
+				s->wheel_accum -= 1.0f;
+			}
+			while (s->wheel_accum <= -1.0f) {
+				dz += 1; /* wheel down -> positive IMPS/2 z */
+				s->wheel_accum += 1.0f;
+			}
+			if (dz != 0)
+				sdl_send_mouse_event(s->pc, 0, 0, dz,
+						     SDL_GetMouseState(NULL, NULL), 0);
+			break;
+		}
+		case SDL_WINDOWEVENT:
+			/* release the pointer when the window loses focus so the user
+			   is never trapped in relative mouse mode */
+			if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST && s->grabbed)
+				sdl_set_grab(s, false);
 			break;
 #endif
 		case SDL_QUIT:
 			exit(0);
 		}
 	}
+}
+
+/* Put host thread into sleep (SDL_WaitEvent) while the guest APM is suspended/standby.
+   Wakes up immediately upon keyboard or mouse activity and clears pc->apm_suspend. */
+static void console_suspend(Console *s)
+{
+	PC *pc = s->pc;
+	fprintf(stderr, "[PM] Guest APM %s: host entering sleep (SDL_WaitEvent)...\n",
+		pc->apm_suspend == 2 ? "Suspend" : "Standby");
+
+	/* Pause audio output so the mixer thread does not loop old buffers during standby */
+	SDL_PauseAudio(1);
+
+	while (pc->apm_suspend && pc->shutdown_state != 8) {
+		SDL_Event ev;
+		if (!SDL_WaitEvent(&ev))
+			break;
+
+		switch (ev.type) {
+		case SDL_QUIT:
+			exit(0);
+
+		case SDL_KEYDOWN:
+		case SDL_MOUSEBUTTONDOWN:
+		case SDL_MOUSEMOTION:
+#if SDL_MAJOR_VERSION >= 2
+		case SDL_MOUSEWHEEL:
+#endif
+			/* User activity detected: wake up guest */
+			pc->apm_suspend = 0;
+			fprintf(stderr, "[PM] Guest wake event (type=0x%x), resuming emulation...\n", ev.type);
+			/* Put the waking event back into queue so normal poll() handles it */
+			SDL_PushEvent(&ev);
+			break;
+
+#if SDL_MAJOR_VERSION >= 2
+		case SDL_WINDOWEVENT:
+			if (ev.window.event == SDL_WINDOWEVENT_EXPOSED ||
+			    ev.window.event == SDL_WINDOWEVENT_RESTORED) {
+				redraw(s, 0, 0, s->width, s->height);
+			} else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST && s->grabbed) {
+				sdl_set_grab(s, false);
+			}
+			break;
+#endif
+
+		default:
+			break;
+		}
+	}
+
+	/* Resume audio output */
+	SDL_PauseAudio(0);
 }
 
 void console_set_audio(Console *console)
@@ -586,7 +707,7 @@ int main(int argc, char *argv[])
 	memset(&conf, 0, sizeof(conf));
 	conf.mem_size = 8 * 1024 * 1024;
 	conf.vga_mem_size = 256 * 1024;
-	conf.width = 720;
+	conf.width = 640;
 	conf.height = 480;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
@@ -617,7 +738,11 @@ int main(int argc, char *argv[])
 	u8 *fb = console_get_fb(console);
 	PC *pc = pc_new(redraw, console, fb, &conf);
 	console->pc = pc;
+	osd_attach_pc(console->osd, pc);
+	osd_attach_emulink(console->osd, pc->emulink);
+	osd_attach_ide(console->osd, pc->ide, pc->ide2);
 	console_set_audio(console);
+
 	load_bios_and_reset(pc);
 
 	pc->boot_start_time = get_uticks();
@@ -625,6 +750,10 @@ int main(int argc, char *argv[])
 		pc_step(pc);
 		poll(console);
 		pc_vga_step(pc);
+		if (pc->apm_suspend)
+			console_suspend(console);
+		if (pc_guest_powered_off(pc))
+			break;
 	}
 	return 0;
 }
