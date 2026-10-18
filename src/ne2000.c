@@ -574,7 +574,6 @@ static void ne2000_step_slirp(NE2000State *ne2000)
 static int parse1(void* user, const char* section,
                   const char* name, const char* value)
 {
-	SlirpConfig *cfg = user;
 #define SEC(a) (strcmp(section, a) == 0)
 #define NAME(a) (strcmp(name, a) == 0)
 	if (SEC("slirp")) {

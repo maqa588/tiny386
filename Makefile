@@ -94,7 +94,13 @@ CFLAGS_CPUABS_y = -DUSE_CPUABS
 CFLAGS += ${CFLAGS_CPUABS_${USE_CPUABS}}
 
 #USE_SLIRP = y/n
+# Guest networking needs libslirp (pkg-config module "libslirp" or "slirp").
+# Auto-detected; run_emu_tiny386.sh installs the package when it is missing.  If
+# it is still absent, warn loudly instead of silently disabling networking.
 USE_SLIRP ?= $(if $(strip ${SLIRP_PKG}),y,n)
+ifeq (${USE_SLIRP},n)
+$(warning tiny386: libslirp not found, guest network disabled - install libslirp)
+endif
 CFLAGS_SLIRP_y = -DUSE_SLIRP ${SLIRP_INC}
 LIBS_SLIRP_y_ = ${SLIRP_LIB}
 LIBS_SLIRP_y_win32 = ${SLIRP_LIB} -lws2_32 -liphlpapi

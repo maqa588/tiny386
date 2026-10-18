@@ -64,6 +64,17 @@ static const char *get_basename(const char *path)
 	return slash ? slash + 1 : path;
 }
 
+/* Bounded copy that always null-terminates; avoids gcc -Wstringop-truncation
+ * warnings that plain strncpy(..., size - 1) triggers on long host paths. */
+static void copy_str(char *dst, size_t dstsz, const char *src)
+{
+	size_t n = strlen(src);
+	if (n > dstsz - 1)
+		n = dstsz - 1;
+	memcpy(dst, src, n);
+	dst[n] = 0;
+}
+
 static int is_image_file(const char *name)
 {
 	const char *dot = strrchr(name, '.');
@@ -135,7 +146,7 @@ static void osd_scan_dir(OSD *osd)
 		}
 
 		if (is_dir || is_image_file(ent->d_name)) {
-			strncpy(osd->files[osd->file_count].name, ent->d_name, sizeof(osd->files[0].name) - 1);
+			copy_str(osd->files[osd->file_count].name, sizeof(osd->files[0].name), ent->d_name);
 			osd->files[osd->file_count].is_dir = is_dir;
 			osd->files[osd->file_count].size = size;
 			osd->file_count++;
@@ -172,7 +183,7 @@ static void osd_cd_into(OSD *osd, const char *name)
 		snprintf(newpath, sizeof(newpath), "/%s", name);
 	else
 		snprintf(newpath, sizeof(newpath), "%s/%s", osd->current_dir, name);
-	strncpy(osd->current_dir, newpath, sizeof(osd->current_dir) - 1);
+	copy_str(osd->current_dir, sizeof(osd->current_dir), newpath);
 	osd_scan_dir(osd);
 }
 
@@ -195,14 +206,14 @@ static void osd_select_file(OSD *osd, const char *name)
 		if (osd->emulink)
 			emulink_attach_floppy(osd->emulink, 0, fullpath);
 		if (osd->pc) {
-			strncpy(osd->pc->fda_path, fullpath, sizeof(osd->pc->fda_path) - 1);
+			copy_str(osd->pc->fda_path, sizeof(osd->pc->fda_path), fullpath);
 			osd->pc->fda_size = size;
 		}
 	} else if (osd->browse_target == BROWSE_TARGET_CDB) {
 		if (osd->ide)
 			ide_change_cd(osd->ide, 1, fullpath);
 		if (osd->pc) {
-			strncpy(osd->pc->cdb_path, fullpath, sizeof(osd->pc->cdb_path) - 1);
+			copy_str(osd->pc->cdb_path, sizeof(osd->pc->cdb_path), fullpath);
 			osd->pc->cdb_size = size;
 		}
 	}
@@ -298,7 +309,7 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 		mu_label(ctx, "--- Storage Drives ---");
 
 		/* HDA: Primary Master HDD (Read-only / Locked) */
-		char hda_info[200];
+		char hda_info[320];
 		if (osd->pc && osd->pc->hda_path[0]) {
 			char sz_buf[32];
 			format_size(sz_buf, sizeof(sz_buf), osd->pc->hda_size);
@@ -311,7 +322,7 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 		mu_label(ctx, hda_info);
 
 		/* FDA: Floppy Drive A */
-		char fda_info[200];
+		char fda_info[320];
 		if (osd->pc && osd->pc->fda_path[0]) {
 			char sz_buf[32];
 			format_size(sz_buf, sizeof(sz_buf), osd->pc->fda_size);
@@ -338,7 +349,7 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 		}
 
 		/* CDB: CD-ROM Drive (primary slave, ISO image) */
-		char cdb_info[200];
+		char cdb_info[320];
 		if (osd->pc && osd->pc->cdb_path[0]) {
 			char sz_buf[32];
 			format_size(sz_buf, sizeof(sz_buf), osd->pc->cdb_size);
@@ -366,7 +377,7 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 
 		/* CDC: virtual CD-ROM from a host shared folder (primary slave,
 		   mutually exclusive with cdb) */
-		char cdc_info[220];
+		char cdc_info[320];
 		if (osd->pc && osd->pc->cdc_path[0]) {
 			snprintf(cdc_info, sizeof(cdc_info), "cdc: %s [Shared Folder]",
 				 get_basename(osd->pc->cdc_path));

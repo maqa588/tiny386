@@ -159,7 +159,10 @@ static void unique_id(IsoNode *list, IsoNode *n)
 		memcpy(base, n->id, bl);
 		strncpy(ext, dot, sizeof(ext) - 1);
 	} else {
-		strncpy(base, n->id, sizeof(base) - 1);
+		int bl = (int)strlen(n->id);
+		if (bl > (int)sizeof(base) - 1)
+			bl = sizeof(base) - 1;
+		memcpy(base, n->id, bl);
 	}
 
 	for (int i = 1; i < 1000; i++) {
@@ -233,6 +236,27 @@ static int cmp_ent(const void *a, const void *b)
 	return strcasecmp(((const ScanEnt *)a)->name, ((const ScanEnt *)b)->name);
 }
 
+/* Bounded "dir/name" concatenation (truncates instead of overflowing), avoids
+ * the gcc -Wformat-truncation noise that snprintf("%s/%s") produces here. */
+static void join_path(char *dst, size_t dstsz, const char *dir, const char *name)
+{
+	size_t dl = strlen(dir);
+	size_t n;
+
+	if (dl > dstsz - 1)
+		dl = dstsz - 1;
+	memcpy(dst, dir, dl);
+	n = dl;
+	if (n < dstsz - 1)
+		dst[n++] = '/';
+	size_t nl = strlen(name);
+	if (nl > dstsz - 1 - n)
+		nl = dstsz - 1 - n;
+	memcpy(dst + n, name, nl);
+	n += nl;
+	dst[n] = 0;
+}
+
 static IsoNode *scan_dir(const char *host_path, IsoNode *dir, int depth, IsoScan *sc)
 {
 	DIR *d = opendir(host_path);
@@ -250,7 +274,7 @@ static IsoNode *scan_dir(const char *host_path, IsoNode *dir, int depth, IsoScan
 			continue;
 
 		char full[ISO_PATH_MAX];
-		snprintf(full, sizeof(full), "%s/%s", host_path, ent->d_name);
+		join_path(full, sizeof(full), host_path, ent->d_name);
 		if (is_forbidden(full, sc))
 			continue;
 
@@ -291,7 +315,7 @@ static IsoNode *scan_dir(const char *host_path, IsoNode *dir, int depth, IsoScan
 		make_id(ents[i].name, ents[i].is_dir, node->id);
 
 		char full[ISO_PATH_MAX];
-		snprintf(full, sizeof(full), "%s/%s", host_path, ents[i].name);
+		join_path(full, sizeof(full), host_path, ents[i].name);
 
 		if (node->is_dir) {
 			sc->dir_count++;
